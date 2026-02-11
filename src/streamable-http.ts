@@ -18,16 +18,19 @@ import { SERVER_NAME, SERVER_VERSION } from './index.js';
 const SESSION_ID_HEADER_NAME = "mcp-session-id";
 const JSON_RPC = "2.0";
 
+/** Factory: create a new MCP Server per connection (SDK allows only one transport per Server). */
+export type McpServerFactory = () => Server;
+
 /**
  * StreamableHTTP MCP Server handler
  */
 class MCPStreamableHttpServer {
-  server: Server;
+  createServer: McpServerFactory;
   // Store active transports by session ID
   transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
-  constructor(server: Server) {
-    this.server = server;
+  constructor(createServer: McpServerFactory) {
+    this.createServer = createServer;
   }
 
   /**
@@ -87,10 +90,11 @@ class MCPStreamableHttpServer {
         return toFetchResponse(res);
       }
 
-      // Create new transport for initialize requests
+      // Create new transport for initialize requests (one Server per session)
       if (!sessionId && this.isInitializeRequest(body)) {
         console.error("Creating new StreamableHTTP transport for initialize request");
 
+        const server = this.createServer();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => uuid(),
         });
@@ -100,8 +104,8 @@ class MCPStreamableHttpServer {
           console.error('StreamableHTTP transport error:', err);
         };
 
-        // Connect the transport to the MCP server
-        await this.server.connect(transport);
+        // Connect the transport to a fresh MCP server (one server per connection)
+        await server.connect(transport);
 
         // Handle the request with the transport
         await transport.handleRequest(req, res, body);
@@ -176,19 +180,19 @@ class MCPStreamableHttpServer {
 /**
  * Sets up a web server for the MCP server using StreamableHTTP transport
  * 
- * @param server The MCP Server instance
+ * @param createServer Factory that returns a new MCP Server (one per connection)
  * @param port The port to listen on (default: 3031)
  * @returns The Hono app instance
  */
-export async function setupStreamableHttpServer(server: Server, port = 3031) {
+export async function setupStreamableHttpServer(createServer: McpServerFactory, port = 3031) {
   // Create Hono app
   const app = new Hono();
 
   // Enable CORS
   app.use('*', cors());
 
-  // Create MCP handler
-  const mcpHandler = new MCPStreamableHttpServer(server);
+  // Create MCP handler (uses factory so each session gets its own Server instance)
+  const mcpHandler = new MCPStreamableHttpServer(createServer);
 
   // Add a simple health check endpoint
   app.get('/health', (c) => {

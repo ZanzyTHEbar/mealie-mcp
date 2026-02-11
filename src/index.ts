@@ -52,10 +52,34 @@ export const API_BASE_URL = process.env.MEALIE_BASE_URL ?? process.env.BASE_URL 
 /**
  * MCP Server instance
  */
-const server = new Server(
-  { name: SERVER_NAME, version: SERVER_VERSION },
-  { capabilities: { tools: {} } }
-);
+/**
+ * Creates a new MCP Server instance (one per connection).
+ * Required because the SDK allows only one transport per Server; Streamable HTTP has multiple sessions.
+ */
+function createMcpServer(): Server {
+  const s = new Server(
+    { name: SERVER_NAME, version: SERVER_VERSION },
+    { capabilities: { tools: {} } }
+  );
+  s.setRequestHandler(ListToolsRequestSchema, async () => {
+    const toolsForClient: Tool[] = Array.from(toolDefinitionMap.values()).map(def => ({
+      name: def.name,
+      description: def.description,
+      inputSchema: def.inputSchema
+    }));
+    return { tools: toolsForClient };
+  });
+  s.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
+    const { name: toolName, arguments: toolArgs } = request.params;
+    const toolDefinition = toolDefinitionMap.get(toolName);
+    if (!toolDefinition) {
+      console.error(`Error: Unknown tool requested: ${toolName}`);
+      return { content: [{ type: "text", text: `Error: Unknown tool requested: ${toolName}` }] };
+    }
+    return await executeApiTool(toolName, toolDefinition, toolArgs ?? {}, securitySchemes);
+  });
+  return s;
+}
 
 /**
  * Map of tool definitions by name
@@ -2567,28 +2591,6 @@ const securitySchemes = {
 };
 
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const toolsForClient: Tool[] = Array.from(toolDefinitionMap.values()).map(def => ({
-    name: def.name,
-    description: def.description,
-    inputSchema: def.inputSchema
-  }));
-  return { tools: toolsForClient };
-});
-
-
-server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
-  const { name: toolName, arguments: toolArgs } = request.params;
-  const toolDefinition = toolDefinitionMap.get(toolName);
-  if (!toolDefinition) {
-    console.error(`Error: Unknown tool requested: ${toolName}`);
-    return { content: [{ type: "text", text: `Error: Unknown tool requested: ${toolName}` }] };
-  }
-  return await executeApiTool(toolName, toolDefinition, toolArgs ?? {}, securitySchemes);
-});
-
-
-
 /**
  * Type definition for cached OAuth tokens
  */
@@ -3003,7 +3005,7 @@ async function executeApiTool(
 async function main() {
   // Set up StreamableHTTP transport
   try {
-    await setupStreamableHttpServer(server, parseInt(process.env.PORT ?? "3031", 10));
+    await setupStreamableHttpServer(createMcpServer, parseInt(process.env.PORT ?? "3031", 10));
   } catch (error) {
     console.error("Error setting up StreamableHTTP server:", error);
     process.exit(1);
