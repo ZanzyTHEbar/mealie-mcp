@@ -53,6 +53,22 @@ export const API_BASE_URL = process.env.MEALIE_BASE_URL ?? process.env.BASE_URL 
  * MCP Server instance
  */
 /**
+ * Ensure inputSchema has type: 'object' at root so MCP clients (e.g. Cursor) accept the tool.
+ * Some generated schemas may have anyOf/oneOf at root and get rejected.
+ */
+function normalizeToolInputSchema(schema: unknown): Tool['inputSchema'] {
+  if (schema && typeof schema === 'object' && 'type' in schema && (schema as { type: string }).type === 'object') {
+    const s = schema as { type: string; properties?: Record<string, object>; required?: string[] };
+    return {
+      type: 'object',
+      ...(s.properties && Object.keys(s.properties).length > 0 && { properties: s.properties }),
+      ...(s.required && s.required.length > 0 && { required: s.required })
+    };
+  }
+  return { type: 'object', properties: {} };
+}
+
+/**
  * Creates a new MCP Server instance (one per connection).
  * Required because the SDK allows only one transport per Server; Streamable HTTP has multiple sessions.
  */
@@ -64,9 +80,10 @@ function createMcpServer(): Server {
   s.setRequestHandler(ListToolsRequestSchema, async () => {
     const toolsForClient: Tool[] = Array.from(toolDefinitionMap.values()).map(def => ({
       name: def.name,
-      description: def.description,
-      inputSchema: def.inputSchema
+      description: def.description ?? '',
+      inputSchema: normalizeToolInputSchema(def.inputSchema)
     }));
+    console.error(`ListTools: returning ${toolsForClient.length} tools`);
     return { tools: toolsForClient };
   });
   s.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
