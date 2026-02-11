@@ -19,14 +19,16 @@ npm run build
 npm run start:http
 ```
 
-- MCP endpoint: `http://localhost:3000/mcp`
-- Test client: `http://localhost:3000`
+- MCP endpoint: `http://localhost:<PORT>/mcp` (default PORT=3031)
+- Test client: `http://localhost:<PORT>`
+
+To use a different port, set `PORT` in your env or `.env`.
 
 ## Environment variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PORT` | HTTP port | `3000` |
+| `PORT` | HTTP port (configurable) | `3031` |
 | `MEALIE_BASE_URL` or `BASE_URL` | Mealie instance URL (e.g. `https://mealie.example.com`) | `https://mealie.example.com` |
 | `BEARER_TOKEN_OAUTH2PASSWORDBEARER` or `OAUTH_TOKEN_OAUTH2PASSWORDBEARER` | Mealie API token (from Mealie Admin → API Tokens, or your OIDC access token) | — |
 
@@ -34,10 +36,12 @@ npm run start:http
 
 ```bash
 docker build -t mealie-mcp .
-docker run -p 3000:3000 \
+docker run -p 3031:3031 \
   -e MEALIE_BASE_URL=https://mealie.example.com \
   -e BEARER_TOKEN_OAUTH2PASSWORDBEARER=your-token \
   mealie-mcp
+
+# Different port: docker run -p 3032:3032 -e PORT=3032 -e MEALIE_BASE_URL=... -e BEARER_TOKEN_...=... mealie-mcp
 ```
 
 ## MCP client configuration
@@ -60,7 +64,7 @@ npx openapi-mcp-generator \
   --base-url https://mealie.example.com \
   --server-name mealie-mcp \
   --transport streamable-http \
-  --port 3000
+  --port 3031
 ```
 
 Regenerate after updating the OpenAPI spec (e.g. after a Mealie upgrade).

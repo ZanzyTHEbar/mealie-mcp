@@ -16,7 +16,8 @@ FROM node:20-alpine
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV PORT=3000
+# Override at runtime if needed: -e PORT=3032 -p 3032:3032
+ENV PORT=3031
 
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev 2>/dev/null || npm install --omit=dev
@@ -24,6 +25,7 @@ RUN npm ci --omit=dev 2>/dev/null || npm install --omit=dev
 COPY --from=builder /app/build ./build
 COPY public ./public
 
-EXPOSE 3000
+# Container listens on $PORT; expose default (override with -p when using different PORT)
+EXPOSE 3031
 
 CMD ["node", "build/index.js", "--transport=streamable-http"]
