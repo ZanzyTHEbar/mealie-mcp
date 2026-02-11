@@ -27,7 +27,7 @@ npm run start:http
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | HTTP port | `3000` |
-| `MEALIE_BASE_URL` or `BASE_URL` | Mealie instance URL (e.g. `https://mealie.example.com`) | `https://mealie.zacariahheim.com` |
+| `MEALIE_BASE_URL` or `BASE_URL` | Mealie instance URL (e.g. `https://mealie.example.com`) | `https://mealie.example.com` |
 | `BEARER_TOKEN_OAUTH2PASSWORDBEARER` or `OAUTH_TOKEN_OAUTH2PASSWORDBEARER` | Mealie API token (from Mealie Admin → API Tokens, or your OIDC access token) | — |
 
 ## Docker
@@ -57,7 +57,7 @@ This server was generated with [openapi-mcp-generator](https://github.com/harsha
 npx openapi-mcp-generator \
   --input mealie-openapi.json \
   --output mealie-mcp \
-  --base-url https://mealie.zacariahheim.com \
+  --base-url https://mealie.example.com \
   --server-name mealie-mcp \
   --transport streamable-http \
   --port 3000
