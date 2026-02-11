@@ -31,13 +31,31 @@ class MCPStreamableHttpServer {
   }
 
   /**
-   * Handle GET requests (typically used for static files)
+   * Handle GET requests: return server info for discovery (e.g. Cursor MCP).
+   * MCP Streamable HTTP uses POST for JSON-RPC; GET allows clients to discover the server.
    */
   async handleGetRequest(c: any) {
-    console.error("GET request received - StreamableHTTP transport only supports POST");
-    return c.text('Method Not Allowed', 405, {
-      'Allow': 'POST'
-    });
+    const accept = c.req.header('Accept') || '';
+    if (accept.includes('text/event-stream')) {
+      return c.text('Method Not Allowed', 405, {
+        'Allow': 'POST',
+        'Content-Type': 'text/plain'
+      });
+    }
+    return c.json(
+      {
+        name: SERVER_NAME,
+        version: SERVER_VERSION,
+        transport: 'streamable-http',
+        message: 'Use POST with JSON-RPC for MCP; include header mcp-session-id for existing sessions.',
+        endpoint: '/mcp'
+      },
+      200,
+      {
+        'Allow': 'POST, GET',
+        'Cache-Control': 'no-store'
+      }
+    );
   }
 
   /**
