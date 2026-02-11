@@ -252,14 +252,15 @@ export async function setupStreamableHttpServer(server: Server, port = 3031) {
     return c.text('Not Found', 404);
   });
 
-  // Start the server
+  // Start the server (hostname 0.0.0.0 so it accepts connections from proxy/other hosts)
   serve({
     fetch: app.fetch,
-    port
+    port,
+    hostname: '0.0.0.0'
   }, (info) => {
-    console.error(`MCP StreamableHTTP Server running at http://localhost:${info.port}`);
-    console.error(`- MCP Endpoint: http://localhost:${info.port}/mcp`);
-    console.error(`- Health Check: http://localhost:${info.port}/health`);
+    console.error(`MCP StreamableHTTP Server running at http://0.0.0.0:${info.port}`);
+    console.error(`- MCP Endpoint: http://<host>:${info.port}/mcp`);
+    console.error(`- Health Check: http://<host>:${info.port}/health`);
   });
 
   return app;
