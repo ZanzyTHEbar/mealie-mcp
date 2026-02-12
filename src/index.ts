@@ -21,6 +21,7 @@ import {
   type PromptMessage
 } from "@modelcontextprotocol/sdk/types.js";
 import { setupStreamableHttpServer } from "./streamable-http.js";
+import { getMealieToken } from "./request-context.js";
 
 import { z, ZodError } from 'zod';
 import { jsonSchemaToZod } from 'json-schema-to-zod';
@@ -248,12 +249,13 @@ function createMcpServer(): Server {
     },
     {
       name: 'mealie_call',
-      description: `Run one Mealie operation. Requires "tool_id" (exact short_id from mealie_registry) and "params" (path/query/requestBody as required). Use after you have stated your plan; then interpret the result for the user in chef/nutritionist/meal-planner terms (e.g. why a recipe fits, what was added to the plan or list).`,
+      description: `Run one Mealie operation. Requires "tool_id" (exact short_id from mealie_registry) and "params" (path/query/requestBody as required). Optional "mealie_token": use in multi-user setups (e.g. Open WebUI) so each user's Mealie API token is used. Use after you have stated your plan; then interpret the result for the user in chef/nutritionist/meal-planner terms.`,
       inputSchema: {
         type: 'object',
         properties: {
           tool_id: { type: 'string', description: 'Exact short_id from mealie_registry (e.g. recipes_list, recipe_get, mealplans_list)' },
-          params: { type: 'object', description: 'Path params (slug, item_id), query (search, perPage), and/or requestBody for POST/PUT' }
+          params: { type: 'object', description: 'Path params (slug, item_id), query (search, perPage), and/or requestBody for POST/PUT' },
+          mealie_token: { type: 'string', description: 'Optional: Mealie API token for this call (multi-user chat UIs; overrides server env and X-Mealie-Token header)' }
         },
         required: ['tool_id']
       }
@@ -298,6 +300,7 @@ function createMcpServer(): Server {
     if (toolName === 'mealie_call') {
       const toolId = typeof args.tool_id === 'string' ? args.tool_id.trim() : '';
       const params = (args.params && typeof args.params === 'object' && !Array.isArray(args.params)) ? (args.params as JsonObject) : {};
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
       const map = getShortIdMap();
       const operationKey = map.get(toolId);
       if (!operationKey) {
@@ -307,7 +310,7 @@ function createMcpServer(): Server {
       if (!toolDefinition) {
         return { content: [{ type: 'text', text: `Error: No definition for ${operationKey}.` }] };
       }
-      return await executeApiTool(operationKey, toolDefinition, params, securitySchemes);
+      return await executeApiTool(operationKey, toolDefinition, params, securitySchemes, mealieToken);
     }
 
     console.error(`Error: Unknown tool requested: ${toolName}`);
@@ -3141,19 +3144,18 @@ async function acquireOAuth2Token(schemeName: string, scheme: any): Promise<stri
 
 /**
  * Executes an API tool with the provided arguments
- * 
- * @param toolName Name of the tool to execute
- * @param definition Tool definition
- * @param toolArgs Arguments provided by the user
- * @param allSecuritySchemes Security schemes from the OpenAPI spec
- * @returns Call tool result
+ *
+ * @param overrideToken Optional Mealie API token for this call (tool param or from X-Mealie-Token header). Used in multi-user setups.
  */
 async function executeApiTool(
   toolName: string,
   definition: McpToolDefinition,
   toolArgs: JsonObject,
-  allSecuritySchemes: Record<string, any>
+  allSecuritySchemes: Record<string, any>,
+  overrideToken?: string
 ): Promise<CallToolResult> {
+  const effectiveToken = overrideToken ?? getMealieToken();
+
   try {
     // Validate arguments against the input schema
     let validatedArgs: JsonObject;
@@ -3235,8 +3237,8 @@ async function executeApiTool(
         // OAuth2 security
         if (scheme.type === 'oauth2') {
           const envKey = schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
-          // Check for pre-existing token (BEARER_TOKEN_* or OAUTH_TOKEN_* — docs recommend BEARER for Mealie API token)
-          if (process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`]) {
+          // Per-request/session token (multi-user) or env
+          if (effectiveToken || process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`]) {
             return true;
           }
 
@@ -3307,8 +3309,8 @@ async function executeApiTool(
         // OAuth2 security
         else if (scheme?.type === 'oauth2') {
           const envKey = schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
-          // Pre-provided token: BEARER_TOKEN_* (Mealie API token) or OAUTH_TOKEN_*
-          let token = process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`];
+          // Priority: per-request token (multi-user) > env
+          let token = effectiveToken || process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`];
 
           // If no token but we have client credentials, try to acquire a token
           if (!token && (scheme.flows?.clientCredentials || scheme.flows?.password)) {

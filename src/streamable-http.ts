@@ -11,8 +11,11 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InitializeRequestSchema, JSONRPCError } from "@modelcontextprotocol/sdk/types.js";
 import { toReqRes, toFetchResponse } from 'fetch-to-node';
 
-// Import server configuration constants
+import { runWithMealieToken } from './request-context.js';
 import { SERVER_NAME, SERVER_VERSION } from './index.js';
+
+/** Header for per-user Mealie API token (multi-tenant chat UIs like Open WebUI). */
+export const MEALIE_TOKEN_HEADER = 'X-Mealie-Token';
 
 // Constants
 const SESSION_ID_HEADER_NAME = "mcp-session-id";
@@ -51,7 +54,9 @@ class MCPStreamableHttpServer {
         version: SERVER_VERSION,
         transport: 'streamable-http',
         message: 'Use POST with JSON-RPC for MCP; include header mcp-session-id for existing sessions.',
-        endpoint: '/mcp'
+        endpoint: '/mcp',
+        perUserTokenHeader: MEALIE_TOKEN_HEADER,
+        perUserTokenHint: 'Send X-Mealie-Token (or Authorization: Bearer) with the logged-in user\'s Mealie API token for multi-user chat UIs.'
       },
       200,
       {
@@ -62,9 +67,18 @@ class MCPStreamableHttpServer {
   }
 
   /**
-   * Handle POST requests (all MCP communication)
+   * Handle POST requests (all MCP communication).
+   * Reads X-Mealie-Token or Authorization: Bearer for per-user token (multi-tenant).
    */
   async handlePostRequest(c: any) {
+    const mealieToken =
+      c.req.header(MEALIE_TOKEN_HEADER)?.trim() ||
+      (c.req.header('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim());
+
+    return runWithMealieToken(mealieToken, () => this.handlePostRequestInner(c));
+  }
+
+  private async handlePostRequestInner(c: any) {
     const sessionId = c.req.header(SESSION_ID_HEADER_NAME);
     console.error(`POST request received ${sessionId ? 'with session ID: ' + sessionId : 'without session ID'}`);
 
