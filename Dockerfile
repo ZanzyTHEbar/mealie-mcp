@@ -28,4 +28,9 @@ COPY public ./public
 # Container listens on $PORT; expose default (override with -p when using different PORT)
 EXPOSE 3031
 
+# Coolify (and Docker) require a healthcheck; uses existing /health endpoint
+RUN apk add --no-cache curl
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://127.0.0.1:${PORT:-3031}/health || exit 1
+
 CMD ["node", "build/index.js", "--transport=streamable-http"]
