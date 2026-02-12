@@ -2977,9 +2977,13 @@ function getShortIdMap(): Map<string, string> {
   return shortIdToOperationKey;
 }
 
+/** Path prefixes that must never appear in the registry (app/admin/auth excluded for agents). */
+const REGISTRY_EXCLUDED_PATH_PREFIXES = ['/api/app/', '/api/admin/', '/api/auth/'];
+
 /**
  * Group operations by first path segment and return markdown registry.
  * Optional query filters by substring match on short_id or description.
+ * App/admin and other excluded paths are never listed (safeguard on top of allowlist).
  */
 function buildRegistryMarkdown(query?: string): string {
   const map = getShortIdMap();
@@ -2987,6 +2991,7 @@ function buildRegistryMarkdown(query?: string): string {
   for (const [shortId, opKey] of map.entries()) {
     const def = toolDefinitionMap.get(opKey);
     if (!def) continue;
+    if (REGISTRY_EXCLUDED_PATH_PREFIXES.some(prefix => def.pathTemplate.startsWith(prefix))) continue;
     const desc = (def.description || '').replace(/\n/g, ' ').trim();
     if (query) {
       const q = query.toLowerCase();
@@ -3229,8 +3234,9 @@ async function executeApiTool(
 
         // OAuth2 security
         if (scheme.type === 'oauth2') {
-          // Check for pre-existing token
-          if (process.env[`OAUTH_TOKEN_${schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`]) {
+          const envKey = schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
+          // Check for pre-existing token (BEARER_TOKEN_* or OAUTH_TOKEN_* — docs recommend BEARER for Mealie API token)
+          if (process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`]) {
             return true;
           }
 
@@ -3300,8 +3306,9 @@ async function executeApiTool(
         }
         // OAuth2 security
         else if (scheme?.type === 'oauth2') {
-          // First try to use a pre-provided token
-          let token = process.env[`OAUTH_TOKEN_${schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`];
+          const envKey = schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
+          // Pre-provided token: BEARER_TOKEN_* (Mealie API token) or OAUTH_TOKEN_*
+          let token = process.env[`BEARER_TOKEN_${envKey}`] || process.env[`OAUTH_TOKEN_${envKey}`];
 
           // If no token but we have client credentials, try to acquire a token
           if (!token && (scheme.flows?.clientCredentials || scheme.flows?.password)) {
