@@ -14,7 +14,8 @@
     "build": "tsc && chmod 755 build/index.js",
     "typecheck": "tsc --noEmit",
     "prestart": "npm run build",
-    "start:http": "node build/index.js --transport=streamable-http"
+    "start:http": "node build/index.js --transport=streamable-http",
+    "dump-ranking": "npm run build && node build/index.js --dump-ranking"
   },
   "engines": {
     "node": ">=20.0.0"

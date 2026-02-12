@@ -13,9 +13,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
   type Tool,
   type CallToolResult,
-  type CallToolRequest
+  type CallToolRequest,
+  type PromptMessage
 } from "@modelcontextprotocol/sdk/types.js";
 import { setupStreamableHttpServer } from "./streamable-http.js";
 
@@ -50,6 +53,156 @@ export const SERVER_VERSION = "1.0.0";
 export const API_BASE_URL = process.env.MEALIE_BASE_URL ?? process.env.BASE_URL ?? "https://mealie.example.com";
 
 /**
+ * Instructions sent to the client when the MCP is loaded. Clients may add this to the system prompt
+ * so the model acts as an expert chef/nutritionist/meal planner and uses Mealie tools correctly.
+ * Uses verbalized reasoning: state your plan and reasoning before acting.
+ */
+const MEALIE_INSTRUCTIONS = `## Your role
+You are an expert personal chef, nutritionist, and meal planner. You help the user with recipes, meal plans, shopping lists, and nutrition-aware choices using their Mealie instance. You speak with warmth and authority: suggest balanced meals, consider dietary needs and preferences, explain why a dish fits their goals, and guide them through planning and cooking.
+
+## How you work with Mealie (verbalized reasoning)
+Before using any tool, briefly say what you are about to do and why. Example: "I'll look up which Mealie operations we have for recipes, then search for weeknight dinners so we can pick one and add it to your meal plan." Then use the tools. After a tool result, briefly interpret it in chef/nutritionist terms when relevant (e.g. "That gives us three options; the second is higher in protein and fits a post-workout meal.").
+
+You have exactly two Mealie tools:
+
+1. **mealie_registry** — Discover what the API can do. Call with no args for the full list, or \`query\`: "recipe", "mealplan", "shopping", "nutrition", "cookbook", etc. Response is markdown of \`short_id\` and description. Use this when you are unsure which operation to call or when starting a new kind of task.
+
+2. **mealie_call** — Run one operation. Requires \`tool_id\` (exact short_id from the registry, e.g. \`recipes_list\`, \`recipe_get\`, \`mealplans_list\`) and \`params\` (path params like \`slug\` or \`item_id\`, query params like \`search\`/\`perPage\`, and for POST/PUT a \`requestBody\` object). Always confirm the exact \`tool_id\` and param names from the registry before calling.
+
+## Workflow (discover → reason → act)
+1. **Discover** — If needed, call mealie_registry (with a focused \`query\`) and read the short_ids.
+2. **Reason** — State in one sentence what you will do and which operation(s) you will use.
+3. **Act** — Call mealie_call with the correct \`tool_id\` and \`params\`. Then summarize or interpret the result for the user in your expert role (chef/nutritionist/meal planner).`;
+
+/**
+ * Custom prompts: expert chef / nutritionist / meal planner with verbalized reasoning.
+ * Each prompt reinforces role, then gives a user query and an assistant reply that models
+ * discover → reason → act and, where useful, considering multiple options before choosing.
+ */
+const MEALIE_PROMPTS: Record<string, { title: string; description: string; messages: PromptMessage[] }> = {
+  mealie_expert_role: {
+    title: "Expert chef, nutritionist & meal planner — Role",
+    description: "Establish the assistant as your personal chef, nutritionist, and meal planner using Mealie.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "From now on, when we talk about food, recipes, or meal planning, act as my expert personal chef, nutritionist, and meal planner. You have access to my Mealie recipe app. Help me plan meals, choose recipes, and use my meal plans and shopping lists. Explain your reasoning before you use any tools, and after results tell me what it means in plain terms (e.g. nutrition, timing, portions)." }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `I'll act as your personal chef, nutritionist, and meal planner. When we work with Mealie I'll:
+
+1. **Say what I'm doing** — Before calling the app I'll briefly state my plan (e.g. "I'll look up recipe operations, then search for quick dinners so we can add one to your plan").
+2. **Use the right operations** — I'll use \`mealie_registry\` to see what's available when needed, then \`mealie_call\` with the correct \`tool_id\` and \`params\`.
+3. **Interpret results for you** — After each step I'll summarize in chef/nutritionist terms: why a recipe fits, how it fits your week, what to watch for (portions, allergens, timing).
+
+Tell me your goals (e.g. more protein, fewer carbs, batch cooking, family dinners) and I'll tailor suggestions and plans accordingly.`
+        }
+      }
+    ]
+  },
+  mealie_verbalized_planning: {
+    title: "Verbalized meal planning — Reason then act",
+    description: "Model for planning a week of dinners with explicit reasoning and tool use.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "Help me plan dinners for the next week. I want a mix of cuisines and something I can batch-cook for two nights." }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `I'll plan your week using verbalized reasoning so you see how I'm thinking.
+
+**My plan:** First I'll check what Mealie can do for recipes and meal plans (mealie_registry with query "recipe" and "mealplan"). Then I'll list your current meal plan so we don't double-book, then search recipes that fit "batch" or "meal prep" and "dinner", and suggest 2–3 options. I'll pick one batch-friendly recipe and one or two quicker ones, then add them to your plan with mealie_call. After each tool I'll summarize what we have and why it works.
+
+**Reasoning:** A balanced week needs variety (cuisines, cooking time) and at least one batch option to save time. I need the exact API short_ids from the registry before calling anything.
+
+I'll start by discovering the relevant operations now.`
+        }
+      }
+    ]
+  },
+  mealie_nutrition_aware_search: {
+    title: "Nutrition-aware recipe search",
+    description: "Find recipes that fit protein/carb/calorie goals with clear reasoning.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "I'm aiming for higher protein and moderate carbs. Find me a few dinner recipes in Mealie that could work and tell me why you picked them." }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `**What I'll do:** I'll look up Mealie's recipe operations (mealie_registry query "recipe"), then search your library for dinners. I'll fetch full details for a few so we can check nutrition if Mealie provides it, and I'll recommend 2–3 that typically suit higher protein / moderate carb (e.g. lean meat, legumes, vegetables, limited refined carbs). I'll state why each fits your goals before you choose.
+
+**Verbalized step:** Calling the registry first to get the exact short_id for listing and searching recipes, then I'll run the search and pull recipe details.`
+        }
+      }
+    ]
+  },
+  mealie_today_and_shopping: {
+    title: "Today's meals and shopping list",
+    description: "Check today's plan and add a recipe's ingredients to the shopping list.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "What's on my meal plan for today? And add the ingredients for tonight's recipe to my shopping list." }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `**Plan:** I'll (1) look up meal plan and shopping list operations in the registry, (2) get today's meals so we know what's for dinner, (3) list your shopping lists to get the right list id, (4) add tonight's recipe ingredients to that list. I'll say each step before I do it and then confirm what was added.
+
+**Reasoning:** "Today's meals" and "add recipe to shopping list" need different API calls; I need the exact short_ids and params (e.g. item_id for the list, recipe slug or id) from the registry. Starting with mealie_registry for "mealplan" and "shopping".`
+        }
+      }
+    ]
+  },
+  mealie_consider_options_then_choose: {
+    title: "Consider options then choose (diverse suggestions)",
+    description: "Verbalized sampling style: consider 2–3 distinct options, then recommend one with reasoning.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "Suggest a few different dinner ideas from my Mealie recipes—maybe one comfort food, one lighter, one quick—then pick the best for a Wednesday and say why." }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `**Approach (verbalized sampling):** I'll pull recipe options from your Mealie library, then consider 2–3 distinct directions (e.g. comfort vs light vs quick) rather than one default. I'll assign each a brief "fit" for Wednesday (energy, time, balance) and then choose one with clear reasoning so you see the tradeoffs.
+
+**Steps:** (1) Registry for recipe operations. (2) List or search recipes, get details for a shortlist. (3) I'll present 2–3 options with one-sentence rationale each. (4) I'll recommend one for Wednesday and state why. After that we can add it to your meal plan if you want.`
+        }
+      }
+    ]
+  },
+  mealie_getting_started: {
+    title: "Mealie tools — Quick reference",
+    description: "Technical summary: mealie_registry and mealie_call workflow.",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: "How do the Mealie MCP tools work in one paragraph?" }
+      },
+      {
+        role: "assistant",
+        content: {
+          type: "text",
+          text: `You have two tools: **mealie_registry** (discover operations; optional \`query\`: "recipe", "mealplan", "shopping") returns markdown of \`short_id\` and description. **mealie_call** runs one operation: pass \`tool_id\` (exact short_id from the registry) and \`params\` (path/query/requestBody as needed). Always use the registry when unsure of \`tool_id\` or param names. Workflow: discover → state your plan → act → interpret results for the user.`
+        }
+      }
+    ]
+  }
+};
+
+/**
  * MCP Server instance
  */
 /**
@@ -75,27 +228,252 @@ function normalizeToolInputSchema(schema: unknown): Tool['inputSchema'] {
 function createMcpServer(): Server {
   const s = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} } }
+    {
+      capabilities: { tools: {}, prompts: {} },
+      instructions: MEALIE_INSTRUCTIONS
+    }
   );
-  s.setRequestHandler(ListToolsRequestSchema, async () => {
-    const toolsForClient: Tool[] = Array.from(toolDefinitionMap.values()).map(def => ({
-      name: def.name,
-      description: def.description ?? '',
-      inputSchema: normalizeToolInputSchema(def.inputSchema)
+
+  // Progressive disclosure: expose only 2 tools (registry + call). Names stay under 60 chars with "mealie:" prefix.
+  const PROGRESSIVE_TOOLS: Tool[] = [
+    {
+      name: 'mealie_registry',
+      description: `Discover Mealie API operations before calling them. Returns a markdown registry of short_id and description, grouped by area (recipes, mealplans, shopping, users, etc.). Always use this first (or when unsure of the correct tool_id). Optional "query" filters by keyword (e.g. "recipe", "mealplan", "shopping", "user"). Then use mealie_call with a short_id from this list.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Optional search term to filter operations (e.g. recipe, mealplan, shopping, user, cookbook)' }
+        }
+      }
+    },
+    {
+      name: 'mealie_call',
+      description: `Run one Mealie operation. Requires "tool_id" (exact short_id from mealie_registry) and "params" (path/query/requestBody as required). Use after you have stated your plan; then interpret the result for the user in chef/nutritionist/meal-planner terms (e.g. why a recipe fits, what was added to the plan or list).`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tool_id: { type: 'string', description: 'Exact short_id from mealie_registry (e.g. recipes_list, recipe_get, mealplans_list)' },
+          params: { type: 'object', description: 'Path params (slug, item_id), query (search, perPage), and/or requestBody for POST/PUT' }
+        },
+        required: ['tool_id']
+      }
+    }
+  ];
+
+  s.setRequestHandler(ListPromptsRequestSchema, async () => {
+    const prompts = Object.entries(MEALIE_PROMPTS).map(([name, p]) => ({
+      name,
+      description: p.description,
+      title: p.title
     }));
-    console.error(`ListTools: returning ${toolsForClient.length} tools`);
-    return { tools: toolsForClient };
+    return { prompts };
+  });
+
+  s.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const name = request.params?.name as string;
+    const prompt = name ? MEALIE_PROMPTS[name] : undefined;
+    if (!prompt) {
+      return {
+        description: `Unknown prompt: ${name}. Available: ${Object.keys(MEALIE_PROMPTS).join(', ')}.`,
+        messages: []
+      };
+    }
+    return { description: prompt.description, messages: prompt.messages };
+  });
+
+  s.setRequestHandler(ListToolsRequestSchema, async () => {
+    console.error(`ListTools: returning ${PROGRESSIVE_TOOLS.length} tools (progressive disclosure)`);
+    return { tools: PROGRESSIVE_TOOLS };
   });
   s.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
     const { name: toolName, arguments: toolArgs } = request.params;
-    const toolDefinition = toolDefinitionMap.get(toolName);
-    if (!toolDefinition) {
-      console.error(`Error: Unknown tool requested: ${toolName}`);
-      return { content: [{ type: "text", text: `Error: Unknown tool requested: ${toolName}` }] };
+    const args = (toolArgs ?? {}) as JsonObject;
+
+    if (toolName === 'mealie_registry') {
+      const query = typeof args.query === 'string' ? args.query : undefined;
+      const markdown = buildRegistryMarkdown(query);
+      return { content: [{ type: 'text', text: markdown }] };
     }
-    return await executeApiTool(toolName, toolDefinition, toolArgs ?? {}, securitySchemes);
+
+    if (toolName === 'mealie_call') {
+      const toolId = typeof args.tool_id === 'string' ? args.tool_id.trim() : '';
+      const params = (args.params && typeof args.params === 'object' && !Array.isArray(args.params)) ? (args.params as JsonObject) : {};
+      const map = getShortIdMap();
+      const operationKey = map.get(toolId);
+      if (!operationKey) {
+        return { content: [{ type: 'text', text: `Error: Unknown tool_id "${toolId}". Use mealie_registry to list valid short_ids.` }] };
+      }
+      const toolDefinition = toolDefinitionMap.get(operationKey);
+      if (!toolDefinition) {
+        return { content: [{ type: 'text', text: `Error: No definition for ${operationKey}.` }] };
+      }
+      return await executeApiTool(operationKey, toolDefinition, params, securitySchemes);
+    }
+
+    console.error(`Error: Unknown tool requested: ${toolName}`);
+    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Use mealie_registry and mealie_call only.` }] };
   });
   return s;
+}
+
+/** Max length for MCP tool name so "mealie:" + name <= 60 */
+const MCP_TOOL_NAME_MAX = 53;
+
+/** Relevance for AI agent: only high/medium/low are exposed; exclude is filtered out. */
+export type ToolRelevance = 'high' | 'medium' | 'low' | 'exclude';
+
+/**
+ * Rank tools by importance and relevance for an AI agent. Returns 'exclude' for operations
+ * that do not make logical sense for an agent (auth flows, admin, binary uploads, etc.).
+ */
+function getRelevance(pathTemplate: string, method: string, operationKey: string): ToolRelevance {
+  const p = pathTemplate;
+  const m = method.toLowerCase();
+
+  // --- EXCLUDE: No use for an AI agent ---
+  if (p.startsWith('/api/app/')) return 'exclude'; // app info, theme, startup (human UI)
+  if (p.startsWith('/api/auth/')) return 'exclude'; // token, oauth, logout, refresh (handled by env/bearer)
+  if (p.startsWith('/api/admin/')) return 'exclude'; // users, households, groups, backups, maintenance, debug, email
+  if (p.startsWith('/api/users/register') || p.startsWith('/api/users/forgot-password') || p.startsWith('/api/users/reset-password')) return 'exclude'; // auth flows
+  if (p.includes('/users/') && (p.includes('/image') || p.includes('/api-tokens'))) return 'exclude'; // user image upload, API token create/delete
+  if (p.startsWith('/api/groups/migrations') || p.startsWith('/api/groups/seeders')) return 'exclude'; // data migration, seed DB
+  if (p.startsWith('/api/groups/reports') && m === 'delete') return 'exclude'; // report delete (admin-ish)
+  if (p.startsWith('/api/groups/storage')) return 'exclude'; // storage stats (admin)
+  if (p.startsWith('/api/households/events/notifications')) return 'exclude'; // event notifiers (webhooks/push config)
+  if (p.startsWith('/api/households/recipe-actions')) return 'exclude'; // external recipe actions / trigger URLs
+  if (p.startsWith('/api/households/webhooks')) return 'exclude'; // webhook config (scheduled push)
+  if (p.startsWith('/api/utils/download')) return 'exclude'; // file download by token (opaque)
+  if (p.startsWith('/api/media/docker')) return 'exclude'; // docker validation (internal)
+  if (p.startsWith('/api/recipes/create/zip') || p.startsWith('/api/recipes/create/image')) return 'exclude'; // binary upload (zip, image) — agent can't send binary
+  if (p.startsWith('/api/recipes/') && p.includes('/image') && (m === 'put' || m === 'post')) return 'exclude'; // recipe image upload / scrape image URL
+  if (p.startsWith('/api/recipes/timeline-events/') && p.includes('/image')) return 'exclude'; // timeline event image upload
+  if (operationKey.includes('oauth_callback') || operationKey.includes('oauth_login')) return 'exclude';
+
+  // --- HIGH: Core agent use cases (read recipes, meal plans, shopping; suggest; add to list) ---
+  if (p.startsWith('/api/recipes') && !p.includes('/bulk-actions') && m === 'get') return 'high'; // list, get one, suggest, exports (read-only)
+  if (p.startsWith('/api/households/mealplans') && !p.includes('/rules')) return 'high'; // mealplan list, today, random, create, get, update, delete
+  if (p.startsWith('/api/households/shopping/lists') || p.startsWith('/api/households/shopping/items')) return 'high'; // shopping lists and items
+  if (p.startsWith('/api/households/cookbooks')) return 'high'; // cookbooks
+  if (p.startsWith('/api/organizers/categories') || p.startsWith('/api/organizers/tags') || p.startsWith('/api/organizers/tools')) return 'high'; // categories, tags, tools (organizers)
+  if (p.startsWith('/api/foods') || p.startsWith('/api/units')) return 'high'; // foods, units (ingredients)
+  if (p.startsWith('/api/parser/')) return 'high'; // parse ingredient(s)
+  if (p === '/api/users/self' || p.startsWith('/api/users/self/ratings') || p.startsWith('/api/users/self/favorites')) return 'high'; // logged-in user, ratings, favorites
+  if (p.startsWith('/api/households/self') || p === '/api/households/members') return 'high'; // household self, members
+  if (p.startsWith('/api/recipes/exports')) return 'high'; // export formats
+
+  // --- MEDIUM: Useful but not primary (create/update/delete recipe, bulk, shared, comments, labels, group info) ---
+  if (p.startsWith('/api/recipes/create/url') || p.startsWith('/api/recipes/create/html')) return 'medium'; // create from URL or HTML/JSON
+  if (p.startsWith('/api/recipes') && (m === 'put' || m === 'patch' || m === 'post' || m === 'delete')) return 'medium'; // recipe update, delete, duplicate, last-made, bulk
+  if (p.startsWith('/api/recipes/shared') || p.startsWith('/api/recipes/comments')) return 'medium'; // shared recipe, comments
+  if (p.startsWith('/api/recipes/timeline-events') && !p.includes('/image')) return 'medium'; // timeline events (no binary)
+  if (p.startsWith('/api/groups/labels')) return 'medium'; // labels (shopping list labels etc.)
+  if (p.startsWith('/api/groups/households') || p.startsWith('/api/groups/self') || p.startsWith('/api/groups/members') || p.startsWith('/api/groups/preferences')) return 'medium'; // group/household info
+  if (p.startsWith('/api/households/preferences') || p.startsWith('/api/households/invitations') || p.startsWith('/api/households/statistics')) return 'medium'; // preferences, invites, stats
+  if (p.startsWith('/api/users/') && (p.includes('/ratings') || p.includes('/favorites'))) return 'medium'; // set rating, add/remove favorite (by user id)
+  if (p.startsWith('/api/users/password') || p === '/api/users/self' || p.includes('/users/{item_id}')) return 'medium'; // password update, user update (self)
+  if (p.startsWith('/api/households/permissions')) return 'medium'; // member permissions
+  if (p.startsWith('/api/explore/')) return 'medium'; // public explore (groups, recipes by group_slug)
+  if (p.startsWith('/api/media/recipes/') && m === 'get') return 'medium'; // recipe image/asset URL (read-only)
+
+  // --- LOW: Niche or rarely needed by agent ---
+  if (p.startsWith('/api/households/mealplans/rules')) return 'low'; // mealplan rules (auto-planning)
+  if (p.startsWith('/api/groups/reports') && m === 'get') return 'low'; // reports list/get
+  if (p.startsWith('/api/comments')) return 'low'; // global comments list
+  if (p.startsWith('/api/shared/recipes')) return 'low'; // shared recipes (create/list/delete share token)
+
+  // Default: allow but rank low (e.g. test scrape URL, get recipe as format)
+  return 'low';
+}
+
+/**
+ * Whether a tool is exposed to the agent (high, medium, low). Excluded tools are not in the registry or callable.
+ */
+function isToolAllowed(relevance: ToolRelevance): boolean {
+  return relevance !== 'exclude';
+}
+
+/** One row for the ranked tool list (for documentation). */
+export interface RankedToolRow {
+  shortId: string;
+  operationKey: string;
+  pathTemplate: string;
+  method: string;
+  relevance: ToolRelevance;
+  description: string;
+}
+
+/**
+ * Builds the full ranked list of all tools (including excluded). Used to generate TOOL_RANKING.md.
+ * ShortIds are computed with same uniqueness as the allowed map, but across all tools.
+ */
+export function getToolRankingList(): RankedToolRow[] {
+  const used = new Set<string>();
+  const rows: RankedToolRow[] = [];
+  for (const [opKey, def] of toolDefinitionMap.entries()) {
+    let shortId = pathToShortId(def.pathTemplate, def.method);
+    let n = 2;
+    while (used.has(shortId)) {
+      shortId = (pathToShortId(def.pathTemplate, def.method).slice(0, MCP_TOOL_NAME_MAX - 4) + '_' + n).slice(0, MCP_TOOL_NAME_MAX);
+      n++;
+    }
+    used.add(shortId);
+    const relevance = getRelevance(def.pathTemplate, def.method, opKey);
+    rows.push({
+      shortId,
+      operationKey: opKey,
+      pathTemplate: def.pathTemplate,
+      method: def.method,
+      relevance,
+      description: (def.description || '').replace(/\n/g, ' ').trim().slice(0, 80)
+    });
+  }
+  const order: Record<ToolRelevance, number> = { high: 0, medium: 1, low: 2, exclude: 3 };
+  rows.sort((a, b) => order[a.relevance] - order[b.relevance] || a.shortId.localeCompare(b.shortId));
+  return rows;
+}
+
+/**
+ * Derives a short, readable id from path and method for registry and call tool.
+ * Keeps ids under MCP_TOOL_NAME_MAX and unique.
+ */
+function pathToShortId(pathTemplate: string, method: string): string {
+  const raw = pathTemplate.replace(/^\/api\/?/, '').split('/').filter(Boolean);
+  const segments = raw.filter(s => !s.startsWith('{'));
+  const hasParam = pathTemplate.includes('{');
+  const m = method.toLowerCase();
+  const action = m === 'get' && !hasParam ? 'list' : m;
+  let base: string;
+  if (segments.length === 0) base = 'root_' + action;
+  else if (segments.length === 1) {
+    const r = segments[0];
+    base = (hasParam ? r.replace(/e?s$/, '') : r) + '_' + action;
+  } else {
+    const last = segments[segments.length - 1];
+    const rest = segments.slice(0, -1);
+    if (hasParam) base = (last.replace(/e?s$/, '') || last) + '_' + action;
+    else base = last + '_' + action;
+    if (rest.length > 0) base = rest[rest.length - 1] + '_' + base;
+  }
+  return base.replace(/[^a-z0-9_]/gi, '_').replace(/_+/g, '_').toLowerCase().slice(0, MCP_TOOL_NAME_MAX);
+}
+
+/**
+ * Builds shortId -> operationKey map from toolDefinitionMap. Ensures uniqueness.
+ */
+function buildShortIdToOperationKey(): Map<string, string> {
+  const result = new Map<string, string>();
+  const used = new Set<string>();
+  for (const [opKey, def] of toolDefinitionMap.entries()) {
+    let shortId = pathToShortId(def.pathTemplate, def.method);
+    let n = 2;
+    while (used.has(shortId)) {
+      shortId = (pathToShortId(def.pathTemplate, def.method).slice(0, MCP_TOOL_NAME_MAX - 4) + '_' + n).slice(0, MCP_TOOL_NAME_MAX);
+      n++;
+    }
+    used.add(shortId);
+    result.set(shortId, opKey);
+  }
+  return result;
 }
 
 /**
@@ -2592,6 +2970,45 @@ system.`,
   }],
 ]);
 
+/** Lazy-built map: short_id -> operationKey (built from toolDefinitionMap) */
+let shortIdToOperationKey: Map<string, string> | null = null;
+function getShortIdMap(): Map<string, string> {
+  if (shortIdToOperationKey === null) shortIdToOperationKey = buildShortIdToOperationKey();
+  return shortIdToOperationKey;
+}
+
+/**
+ * Group operations by first path segment and return markdown registry.
+ * Optional query filters by substring match on short_id or description.
+ */
+function buildRegistryMarkdown(query?: string): string {
+  const map = getShortIdMap();
+  const byGroup = new Map<string, Array<{ shortId: string; description: string }>>();
+  for (const [shortId, opKey] of map.entries()) {
+    const def = toolDefinitionMap.get(opKey);
+    if (!def) continue;
+    const desc = (def.description || '').replace(/\n/g, ' ').trim();
+    if (query) {
+      const q = query.toLowerCase();
+      if (!shortId.toLowerCase().includes(q) && !desc.toLowerCase().includes(q)) continue;
+    }
+    const segment = def.pathTemplate.replace(/^\/api\/?/, '').split('/').filter(Boolean)[0] || 'api';
+    const group = segment.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    if (!byGroup.has(group)) byGroup.set(group, []);
+    byGroup.get(group)!.push({ shortId, description: desc });
+  }
+  const lines: string[] = ['# Mealie API operations (use short_id with mealie_call)', ''];
+  const sortedGroups = [...byGroup.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  for (const [group, entries] of sortedGroups) {
+    lines.push(`## ${group}`);
+    for (const { shortId, description } of entries.sort((a, b) => a.shortId.localeCompare(b.shortId)))
+      lines.push(`- **${shortId}** — ${description}`);
+    lines.push('');
+  }
+  lines.push('---', 'Call with: `mealie_call` and params `tool_id` (short_id above) and `params` (object).');
+  return lines.join('\n');
+}
+
 /**
  * Security schemes from the OpenAPI spec
  */
@@ -3040,6 +3457,61 @@ async function cleanup() {
 // Register signal handlers
 process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);
+
+// CLI: generate TOOL_RANKING.md and exit (no server)
+if (process.argv.includes('--dump-ranking')) {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const rows = getToolRankingList();
+  const byRelevance = { high: rows.filter(r => r.relevance === 'high'), medium: rows.filter(r => r.relevance === 'medium'), low: rows.filter(r => r.relevance === 'low'), exclude: rows.filter(r => r.relevance === 'exclude') };
+  const allowed = rows.filter(r => r.relevance !== 'exclude');
+  const out = [
+    '# Mealie MCP — Tool ranking for AI agents',
+    '',
+    'Tools are ranked by relevance. Only **high**, **medium**, and **low** are exposed to the agent; **exclude** tools are not in the registry and cannot be called.',
+    '',
+    '## Summary',
+    '',
+    '| Relevance | Count | Exposed |',
+    '|-----------|-------|---------|',
+    `| high      | ${byRelevance.high.length}  | yes     |`,
+    `| medium    | ${byRelevance.medium.length}  | yes     |`,
+    `| low       | ${byRelevance.low.length}   | yes     |`,
+    `| exclude   | ${byRelevance.exclude.length}  | no      |`,
+    `| **Total** | **${rows.length}** | **${allowed.length}** |`,
+    '',
+    '## Excluded (not exposed)',
+    '',
+    'These operations do not make logical sense for an AI agent: auth flows, admin, binary uploads, webhooks, migrations, etc.',
+    '',
+    '| short_id | method | path | description |',
+    '|----------|--------|------|-------------|',
+    ...byRelevance.exclude.map(r => `| ${r.shortId} | ${r.method} | ${r.pathTemplate} | ${r.description.slice(0, 50)}... |`),
+    '',
+    '## High relevance (core agent use)',
+    '',
+    '| short_id | method | path | description |',
+    '|----------|--------|------|-------------|',
+    ...byRelevance.high.map(r => `| ${r.shortId} | ${r.method} | ${r.pathTemplate} | ${r.description.slice(0, 50)} |`),
+    '',
+    '## Medium relevance',
+    '',
+    '| short_id | method | path | description |',
+    '|----------|--------|------|-------------|',
+    ...byRelevance.medium.map(r => `| ${r.shortId} | ${r.method} | ${r.pathTemplate} | ${r.description.slice(0, 50)} |`),
+    '',
+    '## Low relevance',
+    '',
+    '| short_id | method | path | description |',
+    '|----------|--------|------|-------------|',
+    ...byRelevance.low.map(r => `| ${r.shortId} | ${r.method} | ${r.pathTemplate} | ${r.description.slice(0, 50)} |`),
+    ''
+  ].join('\n');
+  const outPath = path.join(process.cwd(), 'TOOL_RANKING.md');
+  fs.writeFileSync(outPath, out);
+  console.error(`Wrote ${outPath} (${allowed.length} allowed, ${byRelevance.exclude.length} excluded)`);
+  process.exit(0);
+}
 
 // Start the server
 main().catch((error) => {
