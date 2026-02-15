@@ -27,6 +27,16 @@ import { z, ZodError } from 'zod';
 import { jsonSchemaToZod } from 'json-schema-to-zod';
 import axios, { type AxiosRequestConfig, type AxiosError } from 'axios';
 
+// Food pipeline: price scraping, nutrition lookup, ingredient enrichment
+import {
+  searchContinente,
+  searchNutrition,
+  getNutritionByBarcode,
+  enrichIngredient,
+  enrichIngredients,
+  extractSearchTerm,
+} from './food-pipeline/index.js';
+
 /**
  * Type definition for JSON objects
  */
@@ -64,16 +74,32 @@ You are an expert personal chef, nutritionist, and meal planner. You help the us
 ## How you work with Mealie (verbalized reasoning)
 Before using any tool, briefly say what you are about to do and why. Example: "I'll look up which Mealie operations we have for recipes, then search for weeknight dinners so we can pick one and add it to your meal plan." Then use the tools. After a tool result, briefly interpret it in chef/nutritionist terms when relevant (e.g. "That gives us three options; the second is higher in protein and fits a post-workout meal.").
 
-You have exactly two Mealie tools:
+You have two Mealie API tools and four food pipeline tools:
 
-1. **mealie_registry** — Discover what the API can do. Call with no args for the full list, or \`query\`: "recipe", "mealplan", "shopping", "nutrition", "cookbook", etc. Response is markdown of \`short_id\` and description. Use this when you are unsure which operation to call or when starting a new kind of task.
+### Mealie API tools
+1. **mealie_registry** — Discover what the Mealie API can do. Call with no args for the full list, or \`query\`: "recipe", "mealplan", "shopping", "nutrition", "cookbook", etc. Response is markdown of \`short_id\` and description. Use this when you are unsure which operation to call or when starting a new kind of task.
 
-2. **mealie_call** — Run one operation. Requires \`tool_id\` (exact short_id from the registry, e.g. \`recipes_list\`, \`recipe_get\`, \`mealplans_list\`) and \`params\` (path params like \`slug\` or \`item_id\`, query params like \`search\`/\`perPage\`, and for POST/PUT a \`requestBody\` object). Always confirm the exact \`tool_id\` and param names from the registry before calling.
+2. **mealie_call** — Run one Mealie operation. Requires \`tool_id\` (exact short_id from the registry, e.g. \`recipes_list\`, \`recipe_get\`, \`mealplans_list\`) and \`params\` (path params like \`slug\` or \`item_id\`, query params like \`search\`/\`perPage\`, and for POST/PUT a \`requestBody\` object). Always confirm the exact \`tool_id\` and param names from the registry before calling.
+
+### Food pipeline tools (price, nutrition, enrichment)
+3. **food_price_search** — Search Portuguese grocery stores (Continente.pt) for product prices. Pass \`query\` (product name) and optional \`max_results\`. Returns product name, price in EUR, brand, unit size, price per unit, promotions, and image URL.
+
+4. **food_nutrition_lookup** — Look up nutritional data per 100g from Open Food Facts. Pass \`query\` (product name) or \`barcode\` (EAN). Returns calories, protein, fat, carbs, fiber, sugar, salt.
+
+5. **food_enrich_ingredient** — Combined price + nutrition enrichment for a single ingredient. Pass \`ingredient\` (raw text like "600g chicken breast, diced"). Automatically extracts a clean search term. Returns prices, cheapest option, nutrition, estimated cost, and image.
+
+6. **food_enrich_shopping_list** — Enrich ALL items in a Mealie shopping list in one call. Pass \`list_id\` (UUID). Fetches the list from Mealie, then enriches each unchecked item with prices and nutrition. Returns a full report with per-item data and total estimated cost.
 
 ## Workflow (discover → reason → act)
 1. **Discover** — If needed, call mealie_registry (with a focused \`query\`) and read the short_ids.
 2. **Reason** — State in one sentence what you will do and which operation(s) you will use.
-3. **Act** — Call mealie_call with the correct \`tool_id\` and \`params\`. Then summarize or interpret the result for the user in your expert role (chef/nutritionist/meal planner).`;
+3. **Act** — Call the appropriate tool. Then summarize or interpret the result for the user in your expert role (chef/nutritionist/meal planner).
+
+## When to use food pipeline tools
+- Use \`food_price_search\` when the user asks about grocery prices, wants to compare products, or needs to estimate shopping costs.
+- Use \`food_nutrition_lookup\` when the user asks about nutritional content of a specific food or product.
+- Use \`food_enrich_ingredient\` when analyzing a single recipe ingredient's cost and nutrition.
+- Use \`food_enrich_shopping_list\` when the user wants a full budget/nutrition breakdown of their shopping list.`;
 
 /**
  * Custom prompts: expert chef / nutritionist / meal planner with verbalized reasoning.
@@ -259,6 +285,60 @@ function createMcpServer(): Server {
         },
         required: ['tool_id']
       }
+    },
+    // ── Food Pipeline tools ─────────────────────────────────────────────
+    {
+      name: 'food_price_search',
+      description: 'Search Portuguese grocery stores (Continente.pt) for product prices. Returns product name, price in EUR, brand, unit size, price per unit, promotions, and product image URL. Use for price comparison and shopping budget estimation.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Product name to search for (e.g. "chicken breast", "olive oil", "quinoa")' },
+          max_results: { type: 'number', description: 'Maximum number of results to return (default: 5, max: 10)' }
+        },
+        required: ['query']
+      }
+    },
+    {
+      name: 'food_nutrition_lookup',
+      description: 'Look up nutritional data per 100g from Open Food Facts. Search by product name or barcode (EAN). Returns calories, protein, fat, carbs, fiber, sugar, and salt. Use for dietary analysis and meal planning.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Product name to search for (e.g. "chicken breast", "quinoa")' },
+          barcode: { type: 'string', description: 'EAN/UPC barcode (alternative to query, e.g. "5601312000105")' }
+        }
+      }
+    },
+    {
+      name: 'food_enrich_ingredient',
+      description: 'Enrich a single ingredient with both price data (Continente.pt) and nutritional info (Open Food Facts) in one call. Automatically cleans the ingredient text (removes quantities, prep instructions) to produce a clean search term. Returns prices, cheapest option, nutrition per 100g, estimated cost, and product image.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ingredient: { type: 'string', description: 'Raw ingredient text (e.g. "600g chicken breast, diced", "2 tbsp olive oil", "quinoa")' },
+          quantity: { type: 'string', description: 'Optional quantity context' },
+          skip_price: { type: 'boolean', description: 'Skip price lookup (default: false)' },
+          skip_nutrition: { type: 'boolean', description: 'Skip nutrition lookup (default: false)' },
+          max_price_results: { type: 'number', description: 'Max price results per ingredient (default: 3)' }
+        },
+        required: ['ingredient']
+      }
+    },
+    {
+      name: 'food_enrich_shopping_list',
+      description: 'Enrich ALL items in a Mealie shopping list with prices and nutrition in one call. Fetches the shopping list from Mealie, then for each unchecked item looks up prices (Continente.pt) and nutrition (Open Food Facts). Returns a full report with per-item costs, nutrition, images, and a total estimated cost. Use for budget analysis and nutritional planning of a whole shopping trip.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          list_id: { type: 'string', description: 'Mealie shopping list UUID' },
+          skip_price: { type: 'boolean', description: 'Skip price lookups (default: false)' },
+          skip_nutrition: { type: 'boolean', description: 'Skip nutrition lookups (default: false)' },
+          checked_items: { type: 'boolean', description: 'Include already-checked items (default: false, only enriches unchecked)' },
+          mealie_token: { type: 'string', description: 'Optional: Mealie API token override for multi-user setups' }
+        },
+        required: ['list_id']
+      }
     }
   ];
 
@@ -313,8 +393,127 @@ function createMcpServer(): Server {
       return await executeApiTool(operationKey, toolDefinition, params, securitySchemes, mealieToken);
     }
 
+    // ── Food Pipeline tool handlers ───────────────────────────────────
+
+    if (toolName === 'food_price_search') {
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      if (!query) return { content: [{ type: 'text', text: 'Error: "query" is required.' }] };
+      const maxResults = Math.min(Math.max(parseInt(String(args.max_results ?? '5'), 10) || 5, 1), 10);
+      try {
+        const results = await searchContinente(query, maxResults);
+        if (results.length === 0) {
+          return { content: [{ type: 'text', text: `No products found on Continente.pt for "${query}".` }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Error searching prices: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'food_nutrition_lookup') {
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      const barcode = typeof args.barcode === 'string' ? args.barcode.trim() : '';
+      if (!query && !barcode) return { content: [{ type: 'text', text: 'Error: Provide either "query" or "barcode".' }] };
+      try {
+        const info = barcode
+          ? await getNutritionByBarcode(barcode)
+          : await searchNutrition(query);
+        if (!info) {
+          return { content: [{ type: 'text', text: `No nutritional data found for "${query || barcode}".` }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(info, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Error looking up nutrition: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'food_enrich_ingredient') {
+      const ingredient = typeof args.ingredient === 'string' ? args.ingredient.trim() : '';
+      if (!ingredient) return { content: [{ type: 'text', text: 'Error: "ingredient" is required.' }] };
+      const quantity = typeof args.quantity === 'string' ? args.quantity.trim() || undefined : undefined;
+      const rawMax = args.max_price_results;
+      const maxPriceResults = Math.min(Math.max(parseInt(String(rawMax ?? 3), 10) || 3, 1), 10);
+      try {
+        const enriched = await enrichIngredient(ingredient, quantity, {
+          skipPrice: args.skip_price === true,
+          skipNutrition: args.skip_nutrition === true,
+          maxPriceResults,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(enriched, null, 2) }] };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Error enriching ingredient: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'food_enrich_shopping_list') {
+      const listId = typeof args.list_id === 'string' ? args.list_id.trim() : '';
+      if (!listId) return { content: [{ type: 'text', text: 'Error: "list_id" is required.' }] };
+      const includeChecked = args.checked_items === true;
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required to fetch the shopping list. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER in the server environment or pass mealie_token in the request.' }] };
+      }
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        const listResp = await axios.get(`${mealieBase}/api/households/shopping/lists/${listId}`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+        });
+        const listData = listResp.data;
+        const listName: string = listData?.name ?? 'Shopping List';
+        const allItems: any[] = listData?.listItems ?? [];
+
+        // Filter to unchecked unless includeChecked
+        const items = includeChecked ? allItems : allItems.filter((i: any) => !i.checked);
+
+        if (items.length === 0) {
+          return { content: [{ type: 'text', text: `Shopping list "${listName}" has no ${includeChecked ? '' : 'unchecked '}items to enrich.` }] };
+        }
+
+        // Build ingredient list from shopping items
+        const toEnrich = items.map((item: any) => ({
+          note: item.display ?? item.note ?? item.food?.name ?? 'unknown',
+          quantity: item.quantity != null ? String(item.quantity) : undefined,
+        }));
+
+        const enriched = await enrichIngredients(toEnrich, {
+          skipPrice: args.skip_price === true,
+          skipNutrition: args.skip_nutrition === true,
+        });
+
+        // Compute totals
+        let totalEstimatedCost = 0;
+        let itemsWithPrice = 0;
+        let itemsWithNutrition = 0;
+        for (const e of enriched) {
+          if (e.estimatedCostEur != null) { totalEstimatedCost += e.estimatedCostEur; itemsWithPrice++; }
+          if (e.nutrition) itemsWithNutrition++;
+        }
+
+        const report = {
+          listName,
+          listId,
+          totalItems: items.length,
+          itemsWithPrice,
+          itemsWithNutrition,
+          totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
+          items: enriched,
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404) return { content: [{ type: 'text', text: `Error: Shopping list "${listId}" not found.` }] };
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: `Error: Unauthorized. Check Mealie API token.` }] };
+        return { content: [{ type: 'text', text: `Error enriching shopping list: ${err?.message ?? err}` }] };
+      }
+    }
+
     console.error(`Error: Unknown tool requested: ${toolName}`);
-    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Use mealie_registry and mealie_call only.` }] };
+    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Available tools: mealie_registry, mealie_call, food_price_search, food_nutrition_lookup, food_enrich_ingredient, food_enrich_shopping_list.` }] };
   });
   return s;
 }
