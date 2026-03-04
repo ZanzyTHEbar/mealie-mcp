@@ -22,14 +22,16 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { setupStreamableHttpServer } from "./streamable-http.js";
 import { getMealieToken } from "./request-context.js";
+import { getCachedRegistry } from "./food-pipeline/metadata-cache.js";
+import { createSession, getSessionStats, cleanupExpiredSessions } from "./food-pipeline/session-context.js";
 
 import { z, ZodError } from 'zod';
 import { jsonSchemaToZod } from 'json-schema-to-zod';
 import axios, { type AxiosRequestConfig, type AxiosError } from 'axios';
 
-// Food pipeline: price scraping, nutrition lookup, ingredient enrichment
+// Food pipeline: price scraping (all stores), nutrition lookup, ingredient enrichment
 import {
-  searchContinente,
+  searchAllStores,
   searchNutrition,
   getNutritionByBarcode,
   enrichIngredient,
@@ -54,6 +56,17 @@ interface McpToolDefinition {
   executionParameters: { name: string, in: string }[];
   requestBodyContentType?: string;
   securityRequirements: any[];
+  /** Common parameter patterns for tool hints in registry */
+  commonParams?: string[];
+}
+
+/**
+ * Batch operation definition for parallel execution
+ */
+interface BatchOperation {
+  tool_id: string;
+  params: JsonObject;
+  key: string;           // Result key in response
 }
 
 /**
@@ -74,32 +87,59 @@ You are an expert personal chef, nutritionist, and meal planner. You help the us
 ## How you work with Mealie (verbalized reasoning)
 Before using any tool, briefly say what you are about to do and why. Example: "I'll look up which Mealie operations we have for recipes, then search for weeknight dinners so we can pick one and add it to your meal plan." Then use the tools. After a tool result, briefly interpret it in chef/nutritionist terms when relevant (e.g. "That gives us three options; the second is higher in protein and fits a post-workout meal.").
 
-You have two Mealie API tools and four food pipeline tools:
+## Tool Categories (Progressive Disclosure)
 
-### Mealie API tools
-1. **mealie_registry** — Discover what the Mealie API can do. Call with no args for the full list, or \`query\`: "recipe", "mealplan", "shopping", "nutrition", "cookbook", etc. Response is markdown of \`short_id\` and description. Use this when you are unsure which operation to call or when starting a new kind of task.
+### 1. Composite Quick-Action Tools (Recommended for common workflows)
+These combine multiple operations into a single call, reducing round-trips:
 
-2. **mealie_call** — Run one Mealie operation. Requires \`tool_id\` (exact short_id from the registry, e.g. \`recipes_list\`, \`recipe_get\`, \`mealplans_list\`) and \`params\` (path params like \`slug\` or \`item_id\`, query params like \`search\`/\`perPage\`, and for POST/PUT a \`requestBody\` object). Always confirm the exact \`tool_id\` and param names from the registry before calling.
+- **mealie_recipe_with_cost** — Get a recipe WITH ingredient costs in one call. Pass \`recipe_slug\`. Returns recipe details + enriched ingredients + total cost + per-serving cost. Use for quick recipe cost analysis (1 call vs 3).
+- **mealie_smart_shopping_list** — Get enriched shopping list optimized for store visits. Pass \`list_id\`. Groups items by store for efficient shopping route. Set \`optimize_route: true\` to order stores by price. Use for actual shopping trips.
+- **mealie_mealplan_with_budget** — Get meal plan WITH complete budget + auto-generated shopping list. Pass optional \`days\` and \`start_date\`. Returns plan entries + total cost + consolidated shopping list with duplicates merged. Use for weekly meal planning.
+- **mealie_recipes_with_costs** — Browse recipes with pre-calculated costs. Supports pagination, search, and cost filtering. Use for finding budget-friendly recipes.
 
-### Food pipeline tools (price, nutrition, enrichment)
-3. **food_price_search** — Search Portuguese grocery stores (Continente.pt) for product prices. Pass \`query\` (product name) and optional \`max_results\`. Returns product name, price in EUR, brand, unit size, price per unit, promotions, and image URL.
+### 2. Core Mealie API Tools
+- **mealie_registry** — Discover what the Mealie API can do. Call with optional \`query\` filter. Response shows short_id and description for all operations. Registry is cached for 5 minutes for faster responses.
+- **mealie_call** — Run one Mealie operation. Requires \`tool_id\` (exact short_id from registry) and \`params\`. Supports **batch mode**: set \`batch: true\` with an \`operations\` array to execute multiple independent calls in parallel (returns keyed results).
+- **mealie_start_session** — Initialize multi-turn session context. Returns \`session_id\` for maintaining state across multiple interactions. Sessions expire after 30 minutes.
 
-4. **food_nutrition_lookup** — Look up nutritional data per 100g from Open Food Facts. Pass \`query\` (product name) or \`barcode\` (EAN). Returns calories, protein, fat, carbs, fiber, sugar, salt.
-
-5. **food_enrich_ingredient** — Combined price + nutrition enrichment for a single ingredient. Pass \`ingredient\` (raw text like "600g chicken breast, diced"). Automatically extracts a clean search term. Returns prices, cheapest option, nutrition, estimated cost, and image.
-
-6. **food_enrich_shopping_list** — Enrich ALL items in a Mealie shopping list in one call. Pass \`list_id\` (UUID). Fetches the list from Mealie, then enriches each unchecked item with prices and nutrition. Returns a full report with per-item data and total estimated cost.
+### 3. Food Pipeline Tools (Granular control)
+- **food_price_search** — Search Portuguese grocery stores for product prices.
+- **food_nutrition_lookup** — Look up nutritional data from Open Food Facts.
+- **food_enrich_ingredient** — Enrich a single ingredient with price + nutrition.
+- **food_enrich_shopping_list** — Enrich shopping list with prices + nutrition. Set \`write_back: true\` to save data back to Mealie UI.
+- **food_estimate_mealplan_cost** — Estimate meal plan cost with breakdown.
 
 ## Workflow (discover → reason → act)
 1. **Discover** — If needed, call mealie_registry (with a focused \`query\`) and read the short_ids.
 2. **Reason** — State in one sentence what you will do and which operation(s) you will use.
-3. **Act** — Call the appropriate tool. Then summarize or interpret the result for the user in your expert role (chef/nutritionist/meal planner).
+3. **Act** — Call the appropriate tool. Then summarize or interpret the result.
 
-## When to use food pipeline tools
-- Use \`food_price_search\` when the user asks about grocery prices, wants to compare products, or needs to estimate shopping costs.
-- Use \`food_nutrition_lookup\` when the user asks about nutritional content of a specific food or product.
-- Use \`food_enrich_ingredient\` when analyzing a single recipe ingredient's cost and nutrition.
-- Use \`food_enrich_shopping_list\` when the user wants a full budget/nutrition breakdown of their shopping list.`;
+## Tool Selection Guide
+- **Quick single-recipe cost**: Use \`mealie_recipe_with_cost\`
+- **Weekly meal planning**: Use \`mealie_mealplan_with_budget\`
+- **Shopping trip optimization**: Use \`mealie_smart_shopping_list\`
+- **Browse by budget**: Use \`mealie_recipes_with_costs\`
+- **Multiple unrelated API calls**: Use \`mealie_call\` with \`batch: true\`
+- **Custom workflows**: Use \`mealie_registry\` → \`mealie_call\`
+- **Multi-turn conversation**: Use \`mealie_start_session\` first
+
+## Batch Operations
+Execute multiple independent operations in one round-trip:
+\`\`\`json
+{
+  "batch": true,
+  "operations": [
+    { "tool_id": "recipes_list", "params": { "perPage": 5 }, "key": "recipes" },
+    { "tool_id": "mealplans_today_list", "params": {}, "key": "today" }
+  ]
+}
+\`\`\`
+Returns: \`{ results: { recipes: [...], today: [...] }, completed: 2, failed: 0 }\`
+
+## Caching Features
+- **Registry cache**: mealie_registry responses cached for 5 minutes
+- **Enrichment cache**: Price/nutrition lookups cached for 24 hours (configurable via ENRICHMENT_CACHE_TTL_HOURS)
+- **Session cache**: Multi-turn session data with 30-minute TTL`;
 
 /**
  * Custom prompts: expert chef / nutritionist / meal planner with verbalized reasoning.
@@ -327,7 +367,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'food_enrich_shopping_list',
-      description: 'Enrich ALL items in a Mealie shopping list with prices and nutrition in one call. Fetches the shopping list from Mealie, then for each unchecked item looks up prices (Continente.pt) and nutrition (Open Food Facts). Returns a full report with per-item costs, nutrition, images, and a total estimated cost. Use for budget analysis and nutritional planning of a whole shopping trip.',
+      description: 'Enrich ALL items in a Mealie shopping list with prices and nutrition in one call. Fetches the shopping list from Mealie, then for each unchecked item looks up prices (all registered stores) and nutrition (Open Food Facts). Returns a full report with per-item costs, nutrition, images, and a total estimated cost. Use for budget analysis and nutritional planning of a whole shopping trip. Optionally writes enriched data back to Mealie list item extras for visibility in the UI.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -335,9 +375,96 @@ function createMcpServer(): Server {
           skip_price: { type: 'boolean', description: 'Skip price lookups (default: false)' },
           skip_nutrition: { type: 'boolean', description: 'Skip nutrition lookups (default: false)' },
           checked_items: { type: 'boolean', description: 'Include already-checked items (default: false, only enriches unchecked)' },
+          write_back: { type: 'boolean', description: 'Write enriched data (price, nutrition, image) back to Mealie shopping list item extras so it appears in the Mealie UI (default: false)' },
           mealie_token: { type: 'string', description: 'Optional: Mealie API token override for multi-user setups' }
         },
         required: ['list_id']
+      }
+    },
+    {
+      name: 'food_estimate_mealplan_cost',
+      description: 'Estimate total weekly (or custom period) grocery cost for a Mealie meal plan. Fetches meal plan entries from Mealie, collects all recipe ingredients, enriches them with prices and optional nutrition, and returns total estimated cost plus per-recipe/per-ingredient breakdown. Use for meal plan budgeting.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: 'Number of days to include from start_date (default: 7)' },
+          start_date: { type: 'string', description: 'Start date YYYY-MM-DD (default: today)' },
+          skip_price: { type: 'boolean', description: 'Skip price lookups (default: false)' },
+          skip_nutrition: { type: 'boolean', description: 'Skip nutrition lookups (default: false)' },
+          mealie_token: { type: 'string', description: 'Optional: Mealie API token override for multi-user setups' }
+        },
+        required: []
+      }
+    },
+    // ── Composite High-Intent Tools ───────────────────────────────────
+    {
+      name: 'mealie_recipe_with_cost',
+      description: 'Get a recipe with full ingredient cost breakdown in one call. Fetches recipe details and enriches all ingredients with prices from all registered stores and optional nutrition data. Returns recipe metadata, enriched ingredients, total cost, and per-serving cost. Use for quick recipe cost analysis without multiple round trips.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          recipe_slug: { type: 'string', description: 'Recipe slug identifier (e.g., "chicken-tikka-masala")' },
+          servings: { type: 'number', description: 'Scale ingredients and costs for N servings (default: recipe default servings)' },
+          include_nutrition: { type: 'boolean', description: 'Include nutrition data per ingredient (default: true)' },
+          stores: { type: 'array', items: { type: 'string' }, description: 'Specific stores to search ["Continente", "Pingo Doce"] (default: all registered stores)' }
+        },
+        required: ['recipe_slug']
+      }
+    },
+    {
+      name: 'mealie_smart_shopping_list',
+      description: 'Get enriched shopping list optimized for efficient store visits. Fetches list, enriches items with prices, groups by store for minimum travel, and suggests optimal shopping route. Set optimize_route=true for cheapest store order, group_by_store=true for store-section organization. Use for actual shopping trips vs food_enrich_shopping_list for budget analysis.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          list_id: { type: 'string', description: 'Shopping list UUID' },
+          group_by_store: { type: 'boolean', description: 'Group items by store for efficient route (default: true)' },
+          optimize_route: { type: 'boolean', description: 'Order stores by total price (cheapest first) (default: false)' },
+          max_stores: { type: 'number', description: 'Limit to N stores (default: 3, max: 5)' },
+          include_checked: { type: 'boolean', description: 'Include checked items (default: false)' }
+        },
+        required: ['list_id']
+      }
+    },
+    {
+      name: 'mealie_mealplan_with_budget',
+      description: 'Get meal plan with complete budget breakdown and auto-generated shopping list. Fetches meal plan entries, collects all recipe ingredients, removes duplicates across recipes, enriches with prices, and returns total weekly cost plus consolidated shopping list. Set generate_shopping_list=true to get ready-to-shop list, consolidate_ingredients=true to merge duplicates (e.g., "onions" from 3 recipes become single entry with quantities summed).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: 'Number of days (default: 7)' },
+          start_date: { type: 'string', description: 'YYYY-MM-DD (default: today)' },
+          generate_shopping_list: { type: 'boolean', description: 'Generate consolidated shopping list (default: true)' },
+          consolidate_ingredients: { type: 'boolean', description: 'Merge duplicate ingredients across recipes (default: true)' },
+          include_nutrition: { type: 'boolean', description: 'Include nutrition data (default: false)' }
+        }
+      }
+    },
+    {
+      name: 'mealie_recipes_with_costs',
+      description: 'List recipes with pre-calculated ingredient costs. Combines recipe list fetching with optional cost enrichment per recipe. Supports pagination, search filtering, and cost-based filtering (max_cost_per_recipe). Returns paginated recipes with each recipe\'s total ingredient cost already computed. Use for browsing recipes by budget.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          search: { type: 'string', description: 'Search recipes by name (optional)' },
+          page: { type: 'number', description: 'Page number (default: 1)' },
+          per_page: { type: 'number', description: 'Items per page (default: 10, max: 50)' },
+          include_costs: { type: 'boolean', description: 'Calculate costs for each recipe (default: true)' },
+          max_cost_per_recipe: { type: 'number', description: 'Filter recipes by max total ingredient cost in EUR (optional)' },
+          tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags (optional)' }
+        }
+      }
+    },
+    {
+      name: 'mealie_start_session',
+      description: 'Initialize a session context for multi-turn operations. Sessions maintain state across multiple tool calls to avoid redundant data fetching. Use for complex workflows like meal planning across multiple interactions. Sessions expire after 30 minutes of inactivity. Returns session_id to pass to subsequent compatible tools.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          context_type: { type: 'string', enum: ['meal_planning', 'shopping', 'recipe_comparison', 'general'], description: 'Type of session context' },
+          initial_data: { type: 'object', description: 'Optional initial data to store in session (e.g., { shoppingListId: "uuid" })' }
+        },
+        required: ['context_type']
       }
     }
   ];
@@ -373,14 +500,21 @@ function createMcpServer(): Server {
 
     if (toolName === 'mealie_registry') {
       const query = typeof args.query === 'string' ? args.query : undefined;
-      const markdown = buildRegistryMarkdown(query);
+      const markdown = getCachedRegistry(query, () => buildRegistryMarkdown(undefined));
       return { content: [{ type: 'text', text: markdown }] };
     }
 
     if (toolName === 'mealie_call') {
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+
+      // Batch mode: execute multiple operations in parallel
+      if (args.batch === true && Array.isArray(args.operations)) {
+        return await executeBatchOperations(args.operations as BatchOperation[], mealieToken);
+      }
+
+      // Single operation mode (original behavior)
       const toolId = typeof args.tool_id === 'string' ? args.tool_id.trim() : '';
       const params = (args.params && typeof args.params === 'object' && !Array.isArray(args.params)) ? (args.params as JsonObject) : {};
-      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
       const map = getShortIdMap();
       const operationKey = map.get(toolId);
       if (!operationKey) {
@@ -400,9 +534,9 @@ function createMcpServer(): Server {
       if (!query) return { content: [{ type: 'text', text: 'Error: "query" is required.' }] };
       const maxResults = Math.min(Math.max(parseInt(String(args.max_results ?? '5'), 10) || 5, 1), 10);
       try {
-        const results = await searchContinente(query, maxResults);
+        const results = await searchAllStores(query, maxResults);
         if (results.length === 0) {
-          return { content: [{ type: 'text', text: `No products found on Continente.pt for "${query}".` }] };
+          return { content: [{ type: 'text', text: `No products found for "${query}" across registered stores.` }] };
         }
         return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
       } catch (err: any) {
@@ -449,6 +583,7 @@ function createMcpServer(): Server {
       const listId = typeof args.list_id === 'string' ? args.list_id.trim() : '';
       if (!listId) return { content: [{ type: 'text', text: 'Error: "list_id" is required.' }] };
       const includeChecked = args.checked_items === true;
+      const writeBack = args.write_back === true;
       const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
 
       const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
@@ -493,6 +628,78 @@ function createMcpServer(): Server {
           if (e.nutrition) itemsWithNutrition++;
         }
 
+        // Write-back enriched data to Mealie if requested
+        let writeBackResults: { success: number; failed: number; errors: string[] } | undefined;
+        if (writeBack) {
+          writeBackResults = { success: 0, failed: 0, errors: [] };
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const enrichedData = enriched[i];
+            const itemId = item.id;
+
+            if (!itemId) {
+              writeBackResults.errors.push(`Item ${i}: Missing item ID`);
+              writeBackResults.failed++;
+              continue;
+            }
+
+            // Build extras payload with enriched data
+            const extras: Record<string, any> = {
+              enrichedAt: new Date().toISOString(),
+              searchTerm: enrichedData.searchTerm,
+            };
+
+            if (enrichedData.estimatedCostEur != null) {
+              extras.estimatedCostEur = enrichedData.estimatedCostEur;
+            }
+            if (enrichedData.cheapestPrice) {
+              extras.cheapestPrice = {
+                store: enrichedData.cheapestPrice.store,
+                productName: enrichedData.cheapestPrice.productName,
+                priceEur: enrichedData.cheapestPrice.priceEur,
+                productUrl: enrichedData.cheapestPrice.productUrl,
+              };
+            }
+            if (enrichedData.nutrition) {
+              extras.nutritionPer100g = enrichedData.nutrition;
+            }
+            if (enrichedData.imageUrl) {
+              extras.imageUrl = enrichedData.imageUrl;
+            }
+            if (enrichedData.prices && enrichedData.prices.length > 0) {
+              extras.priceCount = enrichedData.prices.length;
+              extras.stores = [...new Set(enrichedData.prices.map(p => p.store))];
+            }
+
+            try {
+              // Update the shopping list item with enriched data in extras
+              await axios.put(
+                `${mealieBase}/api/households/shopping/items/${itemId}`,
+                {
+                  ...item,
+                  extras: {
+                    ...(item.extras || {}),
+                    ...extras,
+                  },
+                },
+                {
+                  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                  timeout: 10_000,
+                }
+              );
+              writeBackResults.success++;
+              console.log(`[write-back] Updated item ${itemId} with enriched data`);
+            } catch (err: any) {
+              const status = err?.response?.status;
+              const msg = err?.response?.data?.detail || err?.message || 'Unknown error';
+              writeBackResults.errors.push(`Item ${itemId}: ${status} ${msg}`);
+              writeBackResults.failed++;
+              console.error(`[write-back] Failed to update item ${itemId}: ${status} ${msg}`);
+            }
+          }
+        }
+
         const report = {
           listName,
           listId,
@@ -500,6 +707,14 @@ function createMcpServer(): Server {
           itemsWithPrice,
           itemsWithNutrition,
           totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
+          ...(writeBack && writeBackResults && {
+            writeBack: {
+              enabled: true,
+              success: writeBackResults.success,
+              failed: writeBackResults.failed,
+              ...(writeBackResults.errors.length > 0 && { errors: writeBackResults.errors }),
+            },
+          }),
           items: enriched,
         };
 
@@ -512,8 +727,703 @@ function createMcpServer(): Server {
       }
     }
 
+    if (toolName === 'food_estimate_mealplan_cost') {
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
+      }
+      const days = Math.min(Math.max(parseInt(String(args.days ?? '7'), 10) || 7, 1), 90);
+      let startDate: string;
+      if (typeof args.start_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.start_date.trim())) {
+        startDate = args.start_date.trim();
+      } else {
+        const t = new Date();
+        startDate = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
+      }
+      const endDate = new Date(startDate);
+      endDate.setDate(endDate.getDate() + days);
+      const endDateStr = endDate.getFullYear() + '-' + String(endDate.getMonth() + 1).padStart(2, '0') + '-' + String(endDate.getDate()).padStart(2, '0');
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        const listResp = await axios.get(`${mealieBase}/api/households/mealplans`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+          params: { start_date: startDate, end_date: endDateStr }
+        });
+        const items: any[] = listResp.data?.items ?? listResp.data?.data ?? [];
+        const inRange = items.filter((e: any) => {
+          const d = e.date;
+          return d >= startDate && d < endDateStr;
+        });
+
+        // Track text-only entries separately
+        const textOnlyEntries: { date: string; title: string; text?: string }[] = [];
+        const slugToRecipe: Map<string, { name: string; slug: string }> = new Map();
+
+        for (const e of inRange) {
+          const r = e.recipe;
+          if (r?.slug) {
+            slugToRecipe.set(r.slug, { name: r.name ?? r.slug, slug: r.slug });
+          } else if (e.title || e.text) {
+            // Track text-only entries (no recipe attached)
+            textOnlyEntries.push({ date: e.date, title: e.title, text: e.text });
+          }
+        }
+
+        const slugs = [...slugToRecipe.keys()];
+
+        // Fetch all recipes in parallel with individual error handling
+        const recipeResults = await Promise.allSettled(
+          slugs.map(async (slug) => {
+            try {
+              const recipeResp = await axios.get(`${mealieBase}/api/recipes/${slug}`, {
+                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                timeout: 10_000
+              });
+              return { slug, recipe: recipeResp.data };
+            } catch (err: any) {
+              const status = err?.response?.status;
+              console.warn(`[food_estimate_mealplan_cost] Failed to fetch recipe ${slug}: ${status} ${err?.message}`);
+              return { slug, recipe: null, error: `${status}: ${err?.message}` };
+            }
+          })
+        );
+
+        // Build ingredient list with recipe associations
+        const ingredientLines: { note: string; recipeSlug: string; recipeName: string }[] = [];
+        const recipesWithoutIngredients: { slug: string; name: string }[] = [];
+        const failedRecipes: { slug: string; error: string }[] = [];
+
+        for (const result of recipeResults) {
+          if (result.status === 'rejected') {
+            console.warn(`[food_estimate_mealplan_cost] Recipe fetch rejected:`, result.reason);
+            continue;
+          }
+
+          const { slug, recipe, error } = result.value;
+          if (error) {
+            failedRecipes.push({ slug, error });
+            continue;
+          }
+          if (!recipe) continue;
+
+          const lines: string[] = recipe?.recipeIngredient ?? [];
+          const recipeName = slugToRecipe.get(slug)?.name ?? slug;
+
+          if (lines.length === 0) {
+            recipesWithoutIngredients.push({ slug, name: recipeName });
+          }
+
+          for (const line of lines) {
+            if (typeof line === 'string' && line.trim()) {
+              ingredientLines.push({ note: line.trim(), recipeSlug: slug, recipeName });
+            }
+          }
+        }
+
+        if (ingredientLines.length === 0) {
+          return {
+            content: [{
+              type: 'text', text: JSON.stringify({
+                startDate,
+                endDate: endDateStr,
+                days,
+                totalEstimatedCostEur: 0,
+                message: 'No recipe ingredients in the selected meal plan period.',
+                recipesInPeriod: slugs.length,
+                recipesWithoutIngredients: recipesWithoutIngredients.length > 0 ? recipesWithoutIngredients : undefined,
+                failedRecipes: failedRecipes.length > 0 ? failedRecipes : undefined,
+                textOnlyEntries: textOnlyEntries.length > 0 ? textOnlyEntries : undefined,
+                ingredientsCount: 0
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Enrich ingredients (recipe association is tracked via index alignment)
+        const enriched = await enrichIngredients(
+          ingredientLines.map(({ note }) => ({ note, quantity: undefined })),
+          { skipPrice: args.skip_price === true, skipNutrition: args.skip_nutrition === true }
+        );
+
+        // Re-associate enriched results with recipe info
+        const enrichedWithRecipe = enriched.map((e, idx) => ({
+          ...e,
+          recipeSlug: ingredientLines[idx]?.recipeSlug,
+          recipeName: ingredientLines[idx]?.recipeName
+        }));
+
+        // Calculate per-recipe cost breakdown
+        const recipeCostMap = new Map<string, { name: string; slug: string; cost: number; ingredientCount: number }>();
+        for (const e of enrichedWithRecipe) {
+          if (e.recipeSlug && e.estimatedCostEur != null) {
+            const existing = recipeCostMap.get(e.recipeSlug);
+            if (existing) {
+              existing.cost += e.estimatedCostEur;
+              existing.ingredientCount++;
+            } else {
+              recipeCostMap.set(e.recipeSlug, {
+                slug: e.recipeSlug,
+                name: e.recipeName ?? e.recipeSlug,
+                cost: e.estimatedCostEur,
+                ingredientCount: 1
+              });
+            }
+          }
+        }
+
+        let totalCost = 0;
+        for (const e of enriched) {
+          if (e.estimatedCostEur != null) totalCost += e.estimatedCostEur;
+        }
+
+        const report = {
+          startDate,
+          endDate: endDateStr,
+          days,
+          recipesInPeriod: slugs.length,
+          totalIngredients: enriched.length,
+          totalEstimatedCostEur: Math.round(totalCost * 100) / 100,
+          byRecipe: [...recipeCostMap.values()].map(r => ({
+            slug: r.slug,
+            name: r.name,
+            estimatedCostEur: Math.round(r.cost * 100) / 100,
+            ingredientCount: r.ingredientCount
+          })),
+          ingredients: enrichedWithRecipe,
+          ...(textOnlyEntries.length > 0 && { textOnlyEntries }),
+          ...(recipesWithoutIngredients.length > 0 && { recipesWithoutIngredientsWarning: recipesWithoutIngredients }),
+          ...(failedRecipes.length > 0 && { failedRecipes })
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
+        if (status === 404) return { content: [{ type: 'text', text: 'Error: Meal plan not found or no entries in the specified date range.' }] };
+        if (err?.code === 'ECONNABORTED') return { content: [{ type: 'text', text: 'Error: Request timed out. The Mealie server may be slow or unreachable.' }] };
+        return { content: [{ type: 'text', text: `Error estimating meal plan cost: ${err?.message ?? err}` }] };
+      }
+    }
+
+    // ── Composite High-Intent Tool Handlers ─────────────────────────────
+
+    if (toolName === 'mealie_recipe_with_cost') {
+      const recipeSlug = typeof args.recipe_slug === 'string' ? args.recipe_slug.trim() : '';
+      if (!recipeSlug) return { content: [{ type: 'text', text: 'Error: "recipe_slug" is required.' }] };
+      const servings = typeof args.servings === 'number' && args.servings > 0 ? args.servings : undefined;
+      const includeNutrition = args.include_nutrition !== false;
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
+      }
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        // Fetch recipe
+        const recipeResp = await axios.get(`${mealieBase}/api/recipes/${recipeSlug}`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+        });
+        const recipe = recipeResp.data;
+        if (!recipe) {
+          return { content: [{ type: 'text', text: `Error: Recipe "${recipeSlug}" not found.` }] };
+        }
+
+        const recipeName: string = recipe.name ?? recipeSlug;
+        const defaultServings: number = recipe.recipeServings ?? 1;
+        const scaleFactor = servings ? servings / defaultServings : 1;
+        const targetServings = servings ?? defaultServings;
+
+        // Extract ingredients
+        const ingredientLines: string[] = recipe.recipeIngredient ?? [];
+        if (ingredientLines.length === 0) {
+          return {
+            content: [{
+              type: 'text', text: JSON.stringify({
+                recipe: { name: recipeName, slug: recipeSlug, servings: defaultServings },
+                scaledFor: targetServings,
+                ingredients: [],
+                totalCostEur: 0,
+                perServingCostEur: 0,
+                message: 'Recipe has no ingredients.'
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Enrich ingredients
+        const toEnrich = ingredientLines.map((line: string) => ({ note: line, quantity: undefined }));
+        const enriched = await enrichIngredients(toEnrich, {
+          skipPrice: false,
+          skipNutrition: !includeNutrition
+        });
+
+        // Calculate costs with scaling
+        let totalCost = 0;
+        let itemsWithPrice = 0;
+        for (const e of enriched) {
+          if (e.estimatedCostEur != null) {
+            totalCost += e.estimatedCostEur * scaleFactor;
+            itemsWithPrice++;
+          }
+        }
+
+        const report = {
+          recipe: {
+            name: recipeName,
+            slug: recipeSlug,
+            servings: defaultServings,
+            imageUrl: recipe.image,
+          },
+          scaledFor: targetServings,
+          scaleFactor: scaleFactor !== 1 ? Math.round(scaleFactor * 100) / 100 : undefined,
+          ingredients: enriched,
+          totalCostEur: Math.round(totalCost * 100) / 100,
+          perServingCostEur: Math.round((totalCost / targetServings) * 100) / 100,
+          itemsWithPrice,
+          itemsWithNutrition: enriched.filter(e => e.nutrition).length,
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404) return { content: [{ type: 'text', text: `Error: Recipe "${recipeSlug}" not found.` }] };
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
+        return { content: [{ type: 'text', text: `Error fetching recipe with cost: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'mealie_smart_shopping_list') {
+      const listId = typeof args.list_id === 'string' ? args.list_id.trim() : '';
+      if (!listId) return { content: [{ type: 'text', text: 'Error: "list_id" is required.' }] };
+      const groupByStore = args.group_by_store !== false;
+      const optimizeRoute = args.optimize_route === true;
+      const maxStores = Math.min(Math.max(parseInt(String(args.max_stores ?? '3')) || 3, 1), 5);
+      const includeChecked = args.include_checked === true;
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
+      }
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        // Fetch shopping list
+        const listResp = await axios.get(`${mealieBase}/api/households/shopping/lists/${listId}`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+        });
+        const listData = listResp.data;
+        const listName: string = listData?.name ?? 'Shopping List';
+        const allItems: any[] = listData?.listItems ?? [];
+        const items = includeChecked ? allItems : allItems.filter((i: any) => !i.checked);
+
+        if (items.length === 0) {
+          return { content: [{ type: 'text', text: `Shopping list "${listName}" has no ${includeChecked ? '' : 'unchecked '}items to enrich.` }] };
+        }
+
+        // Build ingredient list
+        const toEnrich = items.map((item: any) => ({
+          note: item.display ?? item.note ?? item.food?.name ?? 'unknown',
+          quantity: item.quantity != null ? String(item.quantity) : undefined,
+        }));
+
+        // Enrich all items
+        const enriched = await enrichIngredients(toEnrich, { skipPrice: false, skipNutrition: false });
+
+        // Group by store if requested
+        let byStore: Record<string, any[]> | undefined;
+        let storeOrder: string[] | undefined;
+        if (groupByStore) {
+          byStore = {};
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const enrichedItem = enriched[i];
+            const cheapest = enrichedItem.cheapestPrice;
+            const store = cheapest?.store ?? 'Unknown';
+            if (!byStore[store]) byStore[store] = [];
+            byStore[store].push({
+              original: item.display ?? item.note ?? item.food?.name ?? 'unknown',
+              enriched: enrichedItem,
+              checked: item.checked,
+            });
+          }
+
+          // Calculate store totals for optimization
+          const storeTotals = Object.entries(byStore).map(([store, items]) => ({
+            store,
+            items,
+            totalCost: items.reduce((sum, item) => sum + (item.enriched.estimatedCostEur ?? 0), 0),
+            itemCount: items.length,
+          }));
+
+          // Sort stores by total cost if optimizing route
+          if (optimizeRoute) {
+            storeTotals.sort((a, b) => a.totalCost - b.totalCost);
+          }
+
+          // Limit to maxStores
+          const limitedStores = storeTotals.slice(0, maxStores);
+          storeOrder = limitedStores.map(s => s.store);
+
+          // Rebuild byStore with limited stores
+          byStore = {};
+          for (const { store, items } of limitedStores) {
+            byStore[store] = items;
+          }
+        }
+
+        // Compute totals
+        let totalEstimatedCost = 0;
+        let itemsWithPrice = 0;
+        let itemsWithNutrition = 0;
+        for (const e of enriched) {
+          if (e.estimatedCostEur != null) { totalEstimatedCost += e.estimatedCostEur; itemsWithPrice++; }
+          if (e.nutrition) itemsWithNutrition++;
+        }
+
+        const report = {
+          listName,
+          listId,
+          totalItems: items.length,
+          itemsWithPrice,
+          itemsWithNutrition,
+          totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
+          ...(byStore && { byStore }),
+          ...(storeOrder && { storeOrder }),
+          ...(optimizeRoute && { optimizedBy: 'price' }),
+          items: enriched,
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404) return { content: [{ type: 'text', text: `Error: Shopping list "${listId}" not found.` }] };
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
+        return { content: [{ type: 'text', text: `Error processing smart shopping list: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'mealie_mealplan_with_budget') {
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
+      }
+      const days = Math.min(Math.max(parseInt(String(args.days ?? '7'), 10) || 7, 1), 90);
+      let startDate: string;
+      if (typeof args.start_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.start_date.trim())) {
+        startDate = args.start_date.trim();
+      } else {
+        const t = new Date();
+        startDate = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
+      }
+      const generateShoppingList = args.generate_shopping_list !== false;
+      const consolidateIngredients = args.consolidate_ingredients !== false;
+      const includeNutrition = args.include_nutrition === true;
+      const endDate = new Date(startDate);
+      endDate.setDate(endDate.getDate() + days);
+      const endDateStr = endDate.getFullYear() + '-' + String(endDate.getMonth() + 1).padStart(2, '0') + '-' + String(endDate.getDate()).padStart(2, '0');
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        // Fetch meal plan entries
+        const listResp = await axios.get(`${mealieBase}/api/households/mealplans`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+          params: { start_date: startDate, end_date: endDateStr }
+        });
+        const items: any[] = listResp.data?.items ?? listResp.data?.data ?? [];
+        const inRange = items.filter((e: any) => {
+          const d = e.date;
+          return d >= startDate && d < endDateStr;
+        });
+
+        // Track text-only entries and recipes
+        const textOnlyEntries: { date: string; title: string; text?: string }[] = [];
+        const slugToRecipe: Map<string, { name: string; slug: string }> = new Map();
+
+        for (const e of inRange) {
+          const r = e.recipe;
+          if (r?.slug) {
+            slugToRecipe.set(r.slug, { name: r.name ?? r.slug, slug: r.slug });
+          } else if (e.title || e.text) {
+            textOnlyEntries.push({ date: e.date, title: e.title, text: e.text });
+          }
+        }
+
+        const slugs = [...slugToRecipe.keys()];
+
+        // Fetch all recipes in parallel
+        const recipeResults = await Promise.allSettled(
+          slugs.map(async (slug) => {
+            try {
+              const recipeResp = await axios.get(`${mealieBase}/api/recipes/${slug}`, {
+                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                timeout: 10_000
+              });
+              return { slug, recipe: recipeResp.data };
+            } catch (err: any) {
+              console.warn(`[mealie_mealplan_with_budget] Failed to fetch recipe ${slug}: ${err?.response?.status} ${err?.message}`);
+              return { slug, recipe: null, error: err?.message };
+            }
+          })
+        );
+
+        // Collect all ingredients
+        const allIngredients: { note: string; recipeSlug: string; recipeName: string }[] = [];
+        const recipeCosts: Map<string, { name: string; slug: string; cost: number; ingredientCount: number }> = new Map();
+
+        for (const result of recipeResults) {
+          if (result.status === 'rejected' || !result.value.recipe) continue;
+          const { slug, recipe } = result.value;
+          const recipeName = slugToRecipe.get(slug)?.name ?? slug;
+          const lines: string[] = recipe?.recipeIngredient ?? [];
+
+          for (const line of lines) {
+            if (typeof line === 'string' && line.trim()) {
+              allIngredients.push({ note: line.trim(), recipeSlug: slug, recipeName });
+            }
+          }
+        }
+
+        if (allIngredients.length === 0) {
+          return {
+            content: [{
+              type: 'text', text: JSON.stringify({
+                startDate,
+                endDate: endDateStr,
+                days,
+                recipesInPeriod: slugs.length,
+                totalCostEur: 0,
+                message: 'No recipe ingredients in the selected meal plan period.',
+                textOnlyEntries: textOnlyEntries.length > 0 ? textOnlyEntries : undefined,
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Consolidate duplicate ingredients if requested
+        let ingredientsToEnrich = allIngredients;
+        if (consolidateIngredients) {
+          const seen = new Map<string, { note: string; recipeSlugs: string[]; recipeNames: string[] }>();
+          for (const ing of allIngredients) {
+            const key = ing.note.toLowerCase().trim();
+            if (seen.has(key)) {
+              const existing = seen.get(key)!;
+              if (!existing.recipeSlugs.includes(ing.recipeSlug)) {
+                existing.recipeSlugs.push(ing.recipeSlug);
+                existing.recipeNames.push(ing.recipeName);
+              }
+            } else {
+              seen.set(key, { note: ing.note, recipeSlugs: [ing.recipeSlug], recipeNames: [ing.recipeName] });
+            }
+          }
+          ingredientsToEnrich = [...seen.values()].map(v => ({
+            note: v.note,
+            recipeSlug: v.recipeSlugs.join(','),
+            recipeName: v.recipeNames.join(', ')
+          }));
+        }
+
+        // Enrich all ingredients
+        const enriched = await enrichIngredients(
+          ingredientsToEnrich.map(({ note }) => ({ note, quantity: undefined })),
+          { skipPrice: false, skipNutrition: !includeNutrition }
+        );
+
+        // Calculate per-recipe costs
+        let totalCost = 0;
+        for (let i = 0; i < enriched.length; i++) {
+          const e = enriched[i];
+          const originalIng = ingredientsToEnrich[i];
+          if (e.estimatedCostEur != null) {
+            totalCost += e.estimatedCostEur;
+            // Track per-recipe costs
+            const recipeSlugs = originalIng.recipeSlug.split(',');
+            for (const slug of recipeSlugs) {
+              if (recipeCosts.has(slug)) {
+                const existing = recipeCosts.get(slug)!;
+                existing.cost += e.estimatedCostEur / recipeSlugs.length;
+                existing.ingredientCount++;
+              } else {
+                const recipeInfo = slugToRecipe.get(slug);
+                recipeCosts.set(slug, {
+                  slug,
+                  name: recipeInfo?.name ?? slug,
+                  cost: e.estimatedCostEur / recipeSlugs.length,
+                  ingredientCount: 1
+                });
+              }
+            }
+          }
+        }
+
+        // Build shopping list if requested
+        let shoppingList: any[] | undefined;
+        if (generateShoppingList) {
+          shoppingList = enriched.map((e, i) => ({
+            item: e.originalName,
+            searchTerm: e.searchTerm,
+            estimatedCostEur: e.estimatedCostEur,
+            cheapestStore: e.cheapestPrice?.store,
+            nutrition: e.nutrition,
+            usedIn: ingredientsToEnrich[i].recipeName,
+          }));
+        }
+
+        const report = {
+          startDate,
+          endDate: endDateStr,
+          days,
+          recipesInPeriod: slugs.length,
+          totalCostEur: Math.round(totalCost * 100) / 100,
+          perDayCostEur: Math.round((totalCost / days) * 100) / 100,
+          totalIngredients: enriched.length,
+          uniqueIngredients: consolidateIngredients ? ingredientsToEnrich.length : undefined,
+          byRecipe: [...recipeCosts.values()].map(r => ({
+            slug: r.slug,
+            name: r.name,
+            estimatedCostEur: Math.round(r.cost * 100) / 100,
+            ingredientCount: r.ingredientCount
+          })),
+          ...(shoppingList && { shoppingList }),
+          ...(textOnlyEntries.length > 0 && { textOnlyEntries }),
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
+        if (status === 404) return { content: [{ type: 'text', text: 'Error: Meal plan not found or no entries in the specified date range.' }] };
+        return { content: [{ type: 'text', text: `Error processing meal plan with budget: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'mealie_recipes_with_costs') {
+      const mealieToken = typeof args.mealie_token === 'string' ? args.mealie_token.trim() || undefined : undefined;
+      const token = mealieToken ?? getMealieToken() ?? process.env.BEARER_TOKEN_OAUTH2PASSWORDBEARER ?? '';
+      if (!token) {
+        return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
+      }
+      const search = typeof args.search === 'string' ? args.search.trim() : undefined;
+      const page = Math.max(parseInt(String(args.page ?? '1'), 10) || 1, 1);
+      const perPage = Math.min(Math.max(parseInt(String(args.per_page ?? '10'), 10) || 10, 1), 50);
+      const includeCosts = args.include_costs !== false;
+      const maxCost = typeof args.max_cost_per_recipe === 'number' ? args.max_cost_per_recipe : undefined;
+      const tags = Array.isArray(args.tags) ? args.tags.filter((t): t is string => typeof t === 'string') : undefined;
+
+      try {
+        const mealieBase = API_BASE_URL.replace(/\/$/, '');
+        // Fetch recipes list
+        const params: any = { page, perPage };
+        if (search) params.search = search;
+        if (tags) params.tags = tags;
+
+        const listResp = await axios.get(`${mealieBase}/api/recipes`, {
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          timeout: 15_000,
+          params
+        });
+        const recipes = listResp.data?.items ?? [];
+        const pagination = {
+          page: listResp.data?.page ?? page,
+          perPage: listResp.data?.perPage ?? perPage,
+          total: listResp.data?.total ?? recipes.length,
+          totalPages: listResp.data?.totalPages ?? 1
+        };
+
+        if (recipes.length === 0) {
+          return { content: [{ type: 'text', text: JSON.stringify({ recipes: [], pagination, message: 'No recipes found.' }, null, 2) }] };
+        }
+
+        // Optionally enrich each recipe with costs
+        let recipesWithCosts = recipes;
+        if (includeCosts) {
+          recipesWithCosts = await Promise.all(
+            recipes.map(async (recipe: any) => {
+              const ingredients: string[] = recipe?.recipeIngredient ?? [];
+              if (ingredients.length === 0) {
+                return { ...recipe, totalCostEur: null, ingredientCount: 0 };
+              }
+              const enriched = await enrichIngredients(
+                ingredients.map((note: string) => ({ note, quantity: undefined })),
+                { skipPrice: false, skipNutrition: true }
+              );
+              const totalCost = enriched.reduce((sum, e) => sum + (e.estimatedCostEur ?? 0), 0);
+              return {
+                ...recipe,
+                totalCostEur: Math.round(totalCost * 100) / 100,
+                ingredientCount: ingredients.length,
+                perServingCostEur: recipe.recipeServings ? Math.round((totalCost / recipe.recipeServings) * 100) / 100 : undefined
+              };
+            })
+          );
+        }
+
+        // Filter by max cost if specified
+        if (maxCost != null) {
+          recipesWithCosts = recipesWithCosts.filter((r: any) => (r.totalCostEur ?? Infinity) <= maxCost);
+        }
+
+        const report = {
+          recipes: recipesWithCosts,
+          pagination,
+          ...(search && { search }),
+          ...(maxCost != null && { maxCostPerRecipe: maxCost }),
+          costsIncluded: includeCosts,
+        };
+
+        return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
+      } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
+        return { content: [{ type: 'text', text: `Error fetching recipes with costs: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'mealie_start_session') {
+      const contextType = typeof args.context_type === 'string' ? args.context_type : 'general';
+      const validTypes = ['meal_planning', 'shopping', 'recipe_comparison', 'general'];
+      if (!validTypes.includes(contextType)) {
+        return { content: [{ type: 'text', text: `Error: Invalid context_type. Must be one of: ${validTypes.join(', ')}` }] };
+      }
+      const initialData = (args.initial_data && typeof args.initial_data === 'object' && !Array.isArray(args.initial_data))
+        ? args.initial_data as Record<string, any>
+        : {};
+
+      try {
+        // Cleanup expired sessions periodically
+        cleanupExpiredSessions();
+
+        const sessionId = createSession(contextType as any, initialData);
+        const stats = getSessionStats();
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              sessionId,
+              contextType,
+              created: true,
+              ttlMinutes: stats.ttlMinutes,
+              activeSessions: stats.activeSessions,
+              maxSessions: stats.maxSessions,
+              note: `Pass this session_id to compatible tools for multi-turn context. Session expires after ${stats.ttlMinutes} minutes of inactivity.`
+            }, null, 2)
+          }]
+        };
+      } catch (err: any) {
+        return { content: [{ type: 'text', text: `Error creating session: ${err?.message ?? err}` }] };
+      }
+    }
+
     console.error(`Error: Unknown tool requested: ${toolName}`);
-    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Available tools: mealie_registry, mealie_call, food_price_search, food_nutrition_lookup, food_enrich_ingredient, food_enrich_shopping_list.` }] };
+    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Available tools: mealie_registry, mealie_call, mealie_start_session, mealie_recipe_with_cost, mealie_smart_shopping_list, mealie_mealplan_with_budget, mealie_recipes_with_costs, food_price_search, food_nutrition_lookup, food_enrich_ingredient, food_enrich_shopping_list, food_estimate_mealplan_cost.` }] };
   });
   return s;
 }
@@ -3172,6 +4082,37 @@ system.`,
   }],
 ]);
 
+/**
+ * Common parameter hints for frequently used operations.
+ * These are displayed in the registry to help users construct valid calls.
+ */
+const toolHintsMap: Map<string, string[]> = new Map([
+  // Recipes
+  ["get_all_api_recipes_get", ["{ perPage: 20, search: 'chicken' }", "{ tags: ['dinner'], orderBy: 'name' }"]],
+  ["get_one_api_recipes__slug__get", ["{ slug: 'chicken-tikka-masala' }"]],
+  ["update_one_api_recipes__slug__put", ["{ slug: 'recipe-slug', requestBody: { name: 'New Name' } }"]],
+  // Meal Plans
+  ["get_all_api_households_mealplans_get", ["{ start_date: '2026-02-01', end_date: '2026-02-07' }"]],
+  ["get_todays_meals_api_households_mealplans_today_get", ["{} // No params needed"]],
+  ["create_one_api_households_mealplans_post", ["{ requestBody: { date: '2026-02-08', entryType: 'dinner', recipeId: 'uuid' } }"]],
+  // Shopping Lists
+  ["get_all_api_households_shopping_lists_get", ["{ perPage: 10 }"]],
+  ["get_one_api_households_shopping_lists__item_id__get", ["{ item_id: 'list-uuid' }"]],
+  ["create_one_api_households_shopping_items_post", ["{ requestBody: { shoppingListId: 'list-uuid', note: 'Milk', quantity: 2 } }"]],
+  // Foods/Ingredients
+  ["get_all_api_foods_get", ["{ perPage: 50, search: 'chicken' }"]],
+  ["get_one_api_foods__item_id__get", ["{ item_id: 'food-uuid' }"]],
+  // Tags & Categories
+  ["get_all_api_tags_get", ["{ perPage: 50 }"]],
+  ["get_all_api_categories_get", ["{ perPage: 50 }"]],
+  // Cookbooks
+  ["get_all_api_households_cookbooks_get", ["{ perPage: 20 }"]],
+  ["get_one_api_households_cookbooks__item_id__get", ["{ item_id: 'cookbook-uuid' }"]],
+  // Users & Households
+  ["get_logged_in_user_api_users_self_get", ["{} // No params needed"]],
+  ["get_user_households_api_households_get", ["{ perPage: 10 }"]],
+]);
+
 /** Lazy-built map: short_id -> operationKey (built from toolDefinitionMap) */
 let shortIdToOperationKey: Map<string, string> | null = null;
 function getShortIdMap(): Map<string, string> {
@@ -3189,7 +4130,7 @@ const REGISTRY_EXCLUDED_PATH_PREFIXES = ['/api/app/', '/api/admin/', '/api/auth/
  */
 function buildRegistryMarkdown(query?: string): string {
   const map = getShortIdMap();
-  const byGroup = new Map<string, Array<{ shortId: string; description: string }>>();
+  const byGroup = new Map<string, Array<{ shortId: string; description: string; hints?: string[] }>>();
   for (const [shortId, opKey] of map.entries()) {
     const def = toolDefinitionMap.get(opKey);
     if (!def) continue;
@@ -3202,14 +4143,19 @@ function buildRegistryMarkdown(query?: string): string {
     const segment = def.pathTemplate.replace(/^\/api\/?/, '').split('/').filter(Boolean)[0] || 'api';
     const group = segment.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     if (!byGroup.has(group)) byGroup.set(group, []);
-    byGroup.get(group)!.push({ shortId, description: desc });
+    const hints = toolHintsMap.get(shortId);
+    byGroup.get(group)!.push({ shortId, description: desc, hints });
   }
   const lines: string[] = ['# Mealie API operations (use short_id with mealie_call)', ''];
   const sortedGroups = [...byGroup.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   for (const [group, entries] of sortedGroups) {
     lines.push(`## ${group}`);
-    for (const { shortId, description } of entries.sort((a, b) => a.shortId.localeCompare(b.shortId)))
+    for (const { shortId, description, hints } of entries.sort((a, b) => a.shortId.localeCompare(b.shortId))) {
       lines.push(`- **${shortId}** — ${description}`);
+      if (hints && hints.length > 0) {
+        lines.push(`  Common: ${hints.join(', ')}`);
+      }
+    }
     lines.push('');
   }
   lines.push('---', 'Call with: `mealie_call` and params `tool_id` (short_id above) and `params` (object).');
@@ -3769,6 +4715,47 @@ function formatApiError(error: AxiosError): string {
  * @param toolName Tool name for error reporting
  * @returns Zod schema
  */
+/**
+ * Execute multiple Mealie API operations in parallel (batch mode).
+ * Each operation executes independently; failures are isolated.
+ */
+async function executeBatchOperations(
+  operations: BatchOperation[],
+  overrideToken?: string
+): Promise<CallToolResult> {
+  const results: Record<string, any> = {};
+  const errors: Record<string, string> = {};
+
+  const settled = await Promise.allSettled(
+    operations.map(async (op) => {
+      const map = getShortIdMap();
+      const operationKey = map.get(op.tool_id);
+      if (!operationKey) throw new Error(`Unknown tool_id "${op.tool_id}"`);
+      const toolDefinition = toolDefinitionMap.get(operationKey);
+      if (!toolDefinition) throw new Error(`No definition for ${operationKey}`);
+      return await executeApiTool(operationKey, toolDefinition, op.params, securitySchemes, overrideToken);
+    })
+  );
+
+  settled.forEach((result, idx) => {
+    const key = operations[idx].key;
+    if (result.status === 'fulfilled') {
+      const content = result.value.content[0];
+      if (content?.type === 'text') {
+        try { results[key] = JSON.parse(content.text); }
+        catch { results[key] = content.text; }
+      } else { results[key] = result.value; }
+    } else { errors[key] = result.reason?.message || 'Failed'; }
+  });
+
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({ batch: true, completed: operations.length - Object.keys(errors).length, failed: Object.keys(errors).length, results, ...(Object.keys(errors).length > 0 && { errors }) }, null, 2)
+    }]
+  };
+}
+
 function getZodSchemaFromJsonSchema(jsonSchema: any, toolName: string): z.ZodTypeAny {
   if (typeof jsonSchema !== 'object' || jsonSchema === null) {
     return z.object({}).passthrough();

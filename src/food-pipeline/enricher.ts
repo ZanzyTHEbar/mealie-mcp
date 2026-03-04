@@ -1,15 +1,25 @@
 /**
  * Shopping list enrichment logic.
  *
- * Combines Continente price scraping and Open Food Facts nutrition lookup
- * into a single enrichment step per ingredient. Also includes the search-
- * term extraction heuristic that cleans raw shopping-list note text into
- * a clean product query.
+ * Combines all registered grocery scrapers (Continente, Pingo Doce, Aldi, Lidl, etc.)
+ * and Open Food Facts nutrition lookup into a single enrichment step per ingredient.
+ * Also includes the search-term extraction heuristic.
+ *
+ * Caching: Price and nutrition results are cached with 24h TTL (configurable via
+ * ENRICHMENT_CACHE_TTL_HOURS environment variable). Set ENRICHMENT_CACHE_ENABLED=false
+ * to disable caching.
  */
 
-import { searchContinente } from "./continente-scraper.js";
+import { searchAllStores } from "./scrapers/registry.js";
 import { searchNutrition } from "./nutrition-lookup.js";
 import type { EnrichedItem, PriceResult } from "./types.js";
+import {
+  getCachedPrices,
+  setCachedPrices,
+  getCachedNutrition,
+  setCachedNutrition,
+  isCacheEnabled,
+} from "./cache.js";
 
 /**
  * Extract a clean search term from a raw shopping-list note.
@@ -51,14 +61,17 @@ export function extractSearchTerm(note: string): string {
 
 /**
  * Enrich a single ingredient string with price and nutrition data.
+ *
+ * Results are automatically cached with TTL to avoid repeated API calls.
  */
 export async function enrichIngredient(
   note: string,
   quantity?: string,
-  options?: { skipPrice?: boolean; skipNutrition?: boolean; maxPriceResults?: number }
+  options?: { skipPrice?: boolean; skipNutrition?: boolean; maxPriceResults?: number; skipCache?: boolean }
 ): Promise<EnrichedItem> {
   const searchTerm = extractSearchTerm(note);
   const maxResults = options?.maxPriceResults ?? 3;
+  const useCache = isCacheEnabled() && !options?.skipCache;
 
   const item: EnrichedItem = {
     originalName: note,
@@ -67,9 +80,23 @@ export async function enrichIngredient(
     prices: [],
   };
 
-  // 1. Price lookup
+  // 1. Price lookup (with caching)
   if (!options?.skipPrice) {
-    item.prices = await searchContinente(searchTerm, maxResults);
+    // Check cache first
+    if (useCache) {
+      const cached = getCachedPrices(searchTerm);
+      if (cached !== undefined) {
+        item.prices = cached;
+      }
+    }
+
+    // If not cached, fetch and cache
+    if (item.prices.length === 0) {
+      item.prices = await searchAllStores(searchTerm, maxResults);
+      if (useCache && item.prices.length > 0) {
+        setCachedPrices(searchTerm, item.prices);
+      }
+    }
 
     const priced = item.prices.filter((p): p is PriceResult & { priceEur: number } => p.priceEur != null);
     if (priced.length > 0) {
@@ -79,9 +106,24 @@ export async function enrichIngredient(
     }
   }
 
-  // 2. Nutrition lookup
+  // 2. Nutrition lookup (with caching)
   if (!options?.skipNutrition) {
-    item.nutrition = (await searchNutrition(searchTerm)) ?? undefined;
+    // Check cache first
+    if (useCache) {
+      const cached = getCachedNutrition(searchTerm);
+      if (cached !== undefined) {
+        item.nutrition = cached ?? undefined;
+      }
+    }
+
+    // If not cached, fetch and cache
+    if (item.nutrition === undefined) {
+      const nutrition = await searchNutrition(searchTerm);
+      if (useCache) {
+        setCachedNutrition(searchTerm, nutrition);
+      }
+      item.nutrition = nutrition ?? undefined;
+    }
   }
 
   return item;

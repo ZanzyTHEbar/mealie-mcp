@@ -16,7 +16,8 @@ const USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const REQUEST_DELAY_MS = 1500;
 
-let lastRequestTime = 0;
+// Promise queue to ensure sequential throttling (prevents race conditions)
+let throttlePromise = Promise.resolve();
 
 function getClient(): AxiosInstance {
   return axios.create({
@@ -30,11 +31,17 @@ function getClient(): AxiosInstance {
 }
 
 async function throttle(): Promise<void> {
-  const elapsed = Date.now() - lastRequestTime;
-  if (elapsed < REQUEST_DELAY_MS) {
-    await new Promise((r) => setTimeout(r, REQUEST_DELAY_MS - elapsed));
-  }
-  lastRequestTime = Date.now();
+  // Chain to the existing promise queue to ensure sequential execution
+  const currentThrottle = throttlePromise;
+  throttlePromise = currentThrottle.then(async () => {
+    const startTime = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS));
+    const elapsed = Date.now() - startTime;
+    if (elapsed < REQUEST_DELAY_MS) {
+      await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS - elapsed));
+    }
+  });
+  await throttlePromise;
 }
 
 function parseTile(el: cheerio.Cheerio<any>, $: cheerio.CheerioAPI): PriceResult | null {
@@ -44,7 +51,9 @@ function parseTile(el: cheerio.Cheerio<any>, $: cheerio.CheerioAPI): PriceResult
   if (jsonEl.length) {
     try {
       productData = JSON.parse(jsonEl.attr("data-product-tile-impression") ?? "{}");
-    } catch { /* ignore parse errors */ }
+    } catch (err) {
+      console.warn(`[continente] Failed to parse product tile JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Product name from link text

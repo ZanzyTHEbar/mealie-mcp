@@ -5,6 +5,17 @@
  * Open Food Facts, and the combined enriched item structure.
  */
 
+/**
+ * Adapter interface for grocery store price scrapers.
+ * Implement this to add a new store; register in scrapers/registry.ts.
+ */
+export interface GroceryScraperAdapter {
+  /** Store display name (e.g. "Continente", "Pingo Doce"). */
+  readonly name: string;
+  /** Search the store and return price results. */
+  search(query: string, maxResults?: number): Promise<PriceResult[]>;
+}
+
 /** A single price result from a grocery store scraper. */
 export interface PriceResult {
   store: string;

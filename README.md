@@ -69,6 +69,11 @@ npx openapi-mcp-generator \
 
 Regenerate after updating the OpenAPI spec (e.g. after a Mealie upgrade).
 
+## Testing
+
+- **Unit tests** (no network): `npm test` — runs `extractSearchTerm` and food-pipeline unit tests.
+- **Live tests** (real HTTP): `npm run test:live` — calls Continente.pt and Open Food Facts to validate the food-pipeline. Use `SKIP_CONTINENTE=1` or `SKIP_NUTRITION=1` to skip flaky endpoints.
+
 ## License
 
 MIT. Mealie is licensed under the AGPL; this MCP adapter is a separate layer.
