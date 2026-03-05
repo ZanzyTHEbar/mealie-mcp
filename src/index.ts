@@ -937,8 +937,12 @@ function createMcpServer(): Server {
         const scaleFactor = servings ? servings / defaultServings : 1;
         const targetServings = servings ?? defaultServings;
 
-        // Extract ingredients
-        const ingredientLines: string[] = recipe.recipeIngredient ?? [];
+        // Extract ingredients - handle both string[] and object[] formats
+        const rawIngredients = recipe.recipeIngredient ?? [];
+        const ingredientLines: string[] = rawIngredients.map((ing: any) =>
+          typeof ing === 'string' ? ing : (ing?.display || ing?.note || ing?.name || String(ing))
+        ).filter((line: string) => line && line.trim());
+
         if (ingredientLines.length === 0) {
           return {
             content: [{
