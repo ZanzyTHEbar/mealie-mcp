@@ -139,7 +139,51 @@ Returns: \`{ results: { recipes: [...], today: [...] }, completed: 2, failed: 0 
 ## Caching Features
 - **Registry cache**: mealie_registry responses cached for 5 minutes
 - **Enrichment cache**: Price/nutrition lookups cached for 24 hours (configurable via ENRICHMENT_CACHE_TTL_HOURS)
-- **Session cache**: Multi-turn session data with 30-minute TTL`;
+- **Session cache**: Multi-turn session data with 30-minute TTL
+
+## IMPORTANT: Recipe Import vs Shell Creation
+There are TWO different ways to create recipes:
+
+**1. recipes_post (create_one_api_recipes_post) — SHELL ONLY**
+- Only accepts: \`{ name: "Recipe Name" }\`
+- Creates EMPTY shell recipe with placeholder data
+- Does NOT accept: ingredients, instructions, description, tags, etc.
+- Use for: Quick placeholder creation only
+
+**2. create_html_or_json_post — FULL IMPORT**
+- Accepts: \`{ data: "JSON string with full recipe" }\`
+- Use schema.org Recipe format: \`{ "@context": "https://schema.org", "@type": "Recipe", "name": "...", "recipeIngredient": [...], "recipeInstructions": [...] }\`
+- Set \`includeTags: true, includeCategories: true\` to auto-create taxonomy
+- Use for: Complete recipe import with all fields
+
+**Correct Pattern for Full Recipe Import:**
+\`\`\`json
+{
+  "tool_id": "create_html_or_json_post",
+  "params": {
+    "requestBody": {
+      "includeTags": true,
+      "includeCategories": true,
+      "data": "{ \"@context\": \"https://schema.org\", \"@type\": \"Recipe\", \"name\": \"Chicken Tikka Masala\", \"recipeIngredient\": [\"600g chicken breast\"], ... }"
+    }
+  }
+}
+\`\`\`
+
+**Wrong Pattern (Creates Shell Only):**
+\`\`\`json
+// ❌ WRONG: recipes_post only uses 'name' field
+{
+  "tool_id": "recipes_post",
+  "params": {
+    "requestBody": {
+      "name": "Chicken Tikka Masala",
+      "description": "...",  // IGNORED
+      "recipeIngredient": [...]  // IGNORED
+    }
+  }
+}
+\`\`\``;
 
 /**
  * Custom prompts: expert chef / nutritionist / meal planner with verbalized reasoning.
@@ -4095,6 +4139,9 @@ const toolHintsMap: Map<string, string[]> = new Map([
   ["get_all_api_recipes_get", ["{ perPage: 20, search: 'chicken' }", "{ tags: ['dinner'], orderBy: 'name' }"]],
   ["get_one_api_recipes__slug__get", ["{ slug: 'chicken-tikka-masala' }"]],
   ["update_one_api_recipes__slug__put", ["{ slug: 'recipe-slug', requestBody: { name: 'New Name' } }"]],
+  // ⚠️ IMPORTANT: These two recipe creation endpoints are DIFFERENT
+  ["recipes_post", ["⚠️ SHELL ONLY: { name: 'Recipe Name' } - Creates empty placeholder", "❌ Does NOT accept ingredients, instructions, description"]],
+  ["create_html_or_json_post", ["✅ FULL IMPORT: { includeTags: true, includeCategories: true, data: 'schema.org JSON string' }", "Use for complete recipe with ingredients, instructions, etc."]],
   // Meal Plans
   ["get_all_api_households_mealplans_get", ["{ start_date: '2026-02-01', end_date: '2026-02-07' }"]],
   ["get_todays_meals_api_households_mealplans_today_get", ["{} // No params needed"]],
