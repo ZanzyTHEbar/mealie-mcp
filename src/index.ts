@@ -4194,7 +4194,7 @@ function buildRegistryMarkdown(query?: string): string {
     const segment = def.pathTemplate.replace(/^\/api\/?/, '').split('/').filter(Boolean)[0] || 'api';
     const group = segment.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     if (!byGroup.has(group)) byGroup.set(group, []);
-    const hints = toolHintsMap.get(shortId);
+    const hints = toolHintsMap.get(shortId) ?? toolHintsMap.get(opKey);
     byGroup.get(group)!.push({ shortId, description: desc, hints });
   }
   const lines: string[] = ['# Mealie API operations (use short_id with mealie_call)', ''];
