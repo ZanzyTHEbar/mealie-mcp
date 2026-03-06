@@ -23,6 +23,8 @@ function filterRegistryByQuery(markdown: string, query: string): string {
   let currentGroup: string[] = [];
   let currentGroupHeader = '';
 
+  let lastMatchWasTool = false;
+
   for (const line of lines) {
     // Group header line (## groupname)
     if (line.startsWith('## ')) {
@@ -31,12 +33,20 @@ function filterRegistryByQuery(markdown: string, query: string): string {
       }
       currentGroupHeader = line;
       currentGroup = [];
+      lastMatchWasTool = false;
     }
     // Tool entry line (- **short_id** — description)
     else if (line.startsWith('- **')) {
       if (line.toLowerCase().includes(q)) {
         currentGroup.push(line);
+        lastMatchWasTool = true;
+      } else {
+        lastMatchWasTool = false;
       }
+    }
+    // Hint line (  Common: ...) - include if previous tool matched
+    else if (line.trim().startsWith('Common:') && lastMatchWasTool) {
+      currentGroup.push(line);
     }
     // Other lines (pass through if we're in a matching group)
     else {
