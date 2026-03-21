@@ -12,7 +12,7 @@ export const tdeeCalculationInputSchema = z
     body_fat_pct: z.coerce.number().min(2).max(70).optional(),
     formula: z.enum(["auto", "mifflin_st_jeor", "cunningham"]).default("auto"),
     goal: z.enum(["maintain", "cut", "gain", "custom"]).default("maintain"),
-    goal_delta_kcal: z.coerce.number().int().min(-2000).max(2000).optional(),
+    goal_delta_kcal: z.coerce.number().min(-2000).max(2000).optional(),
   })
   .superRefine((value, ctx) => {
     if (value.activity_level === "custom" && value.activity_multiplier == null) {

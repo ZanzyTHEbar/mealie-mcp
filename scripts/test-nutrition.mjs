@@ -96,6 +96,21 @@ async function main() {
   eq(femaleCut.tdee_kcal, 1830, "female light activity TDEE rounds correctly");
   eq(femaleCut.selected_goal_target_kcal, 1330, "default cut target applies a 500 kcal deficit");
 
+  const autoWithBodyFat = calculateTdee(
+    parseTdeeCalculationInput({
+      age_years: 35,
+      sex_for_formula: "male",
+      height_cm: 175,
+      weight_kg: 80,
+      body_fat_pct: 20,
+      activity_level: "active",
+      formula: "auto",
+      goal: "maintain",
+    }),
+  );
+  eq(autoWithBodyFat.formula_used, "mifflin_st_jeor", "auto keeps Mifflin-St Jeor as the primary formula");
+  eq(autoWithBodyFat.alternative_estimates?.cunningham, 1910, "auto exposes Cunningham as an alternative resting estimate");
+
   const cunningham = calculateTdee(
     parseTdeeCalculationInput({
       age_years: 35,

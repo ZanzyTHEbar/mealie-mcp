@@ -111,7 +111,7 @@ These combine multiple operations into a single call, reducing round-trips:
 - **food_estimate_mealplan_cost** — Estimate meal plan cost with breakdown.
 
 ### 4. Nutrition Planning Tools
-- **nutrition_tdee_calculate** — Estimate adult maintenance calories (TDEE) plus cut/gain targets using validated activity multipliers. Defaults to Mifflin-St Jeor and can use Cunningham when body-fat data is available.
+- **nutrition_tdee_calculate** — Estimate adult maintenance calories (TDEE) plus cut/gain targets using standard PAL-style activity multipliers. Defaults to Mifflin-St Jeor and uses Cunningham only when it is explicitly requested with body-fat data.
 
 ## Workflow (discover → reason → act)
 1. **Discover** — If needed, call mealie_registry (with a focused \`query\`) and read the short_ids.
@@ -401,7 +401,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'food_enrich_ingredient',
-      description: 'Enrich a single ingredient with both price data (Continente.pt) and nutritional info (Open Food Facts) in one call. Automatically cleans the ingredient text (removes quantities, prep instructions) to produce a clean search term. Returns prices, cheapest option, nutrition per 100g, estimated cost, and product image.',
+      description: 'Enrich a single ingredient with both price data (all registered stores) and nutritional info (Open Food Facts) in one call. Automatically cleans the ingredient text (removes quantities, prep instructions) to produce a clean search term. Returns prices, cheapest option, nutrition per 100g, estimated cost, and product image.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -447,7 +447,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'nutrition_tdee_calculate',
-      description: 'Calculate adult TDEE (total daily energy expenditure) and calorie targets for maintenance, cutting, or gaining. Uses Mifflin-St Jeor by default and Cunningham when body-fat percentage is supplied and requested. Returns resting energy, activity multiplier, maintenance calories, recommended target ranges, assumptions, and warnings.',
+      description: 'Calculate adult TDEE (total daily energy expenditure) and calorie targets for maintenance, cutting, or gaining. Uses Mifflin-St Jeor by default and Cunningham only when body-fat percentage is supplied and explicitly requested. Returns resting energy, activity multiplier, maintenance calories, alternative resting-energy estimates when available, assumptions, and warnings.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -458,7 +458,7 @@ function createMcpServer(): Server {
           activity_level: { type: 'string', enum: ['sedentary', 'light', 'moderate', 'active', 'very_active', 'custom'], description: 'Lifestyle/training multiplier bucket. Use custom only when supplying activity_multiplier.' },
           activity_multiplier: { type: 'number', description: 'Custom activity multiplier (required only when activity_level is custom).' },
           body_fat_pct: { type: 'number', description: 'Optional body-fat percentage. Required for Cunningham.' },
-          formula: { type: 'string', enum: ['auto', 'mifflin_st_jeor', 'cunningham'], description: 'Energy equation. auto defaults to Mifflin-St Jeor and includes Cunningham as an alternative when body-fat is available.' },
+          formula: { type: 'string', enum: ['auto', 'mifflin_st_jeor', 'cunningham'], description: 'Energy equation. auto defaults to Mifflin-St Jeor. Cunningham is used only when explicitly selected with body_fat_pct, while auto may expose Cunningham under alternative_estimates as an additional resting-energy reference.' },
           goal: { type: 'string', enum: ['maintain', 'cut', 'gain', 'custom'], description: 'Primary calorie goal. custom requires goal_delta_kcal.' },
           goal_delta_kcal: { type: 'number', description: 'Custom daily calorie delta relative to TDEE, such as -300 or +200.' }
         },
@@ -482,14 +482,14 @@ function createMcpServer(): Server {
     },
     {
       name: 'mealie_smart_shopping_list',
-      description: 'Get enriched shopping list optimized for efficient store visits. Fetches list, enriches items with prices, groups by store for minimum travel, and suggests optimal shopping route. Set optimize_route=true for cheapest store order, group_by_store=true for store-section organization. Use for actual shopping trips vs food_enrich_shopping_list for budget analysis.',
+      description: 'Get enriched shopping list organized for efficient store visits. Fetches list, enriches items with prices, groups by store, and can rank recommended stores by estimated subtotal. Set optimize_route=true to sort recommendations by price, group_by_store=true for store-section organization, and max_stores to limit recommendedStores without hiding item visibility.',
       inputSchema: {
         type: 'object',
         properties: {
           list_id: { type: 'string', description: 'Shopping list UUID' },
           group_by_store: { type: 'boolean', description: 'Group items by store for efficient route (default: true)' },
           optimize_route: { type: 'boolean', description: 'Order stores by total price (cheapest first) (default: false)' },
-          max_stores: { type: 'number', description: 'Limit to N stores (default: 3, max: 5)' },
+          max_stores: { type: 'number', description: 'Limit recommendedStores to N stores (default: 3, max: 5) without dropping items from the grouped output.' },
           include_checked: { type: 'boolean', description: 'Include checked items (default: false)' }
         },
         required: ['list_id']
@@ -1127,6 +1127,9 @@ function createMcpServer(): Server {
         // Group by store if requested
         let byStore: Record<string, any[]> | undefined;
         let storeOrder: string[] | undefined;
+        let recommendedStores:
+          | Array<{ store: string; totalCostEur: number; itemCount: number }>
+          | undefined;
         if (groupByStore) {
           byStore = {};
           for (let i = 0; i < items.length; i++) {
@@ -1155,15 +1158,14 @@ function createMcpServer(): Server {
             storeTotals.sort((a, b) => a.totalCost - b.totalCost);
           }
 
-          // Limit to maxStores
+          // Preserve all grouped items; maxStores only limits the recommendation summary.
+          storeOrder = storeTotals.map(s => s.store);
           const limitedStores = storeTotals.slice(0, maxStores);
-          storeOrder = limitedStores.map(s => s.store);
-
-          // Rebuild byStore with limited stores
-          byStore = {};
-          for (const { store, items } of limitedStores) {
-            byStore[store] = items;
-          }
+          recommendedStores = limitedStores.map(({ store, totalCost, itemCount }) => ({
+            store,
+            totalCostEur: Math.round(totalCost * 100) / 100,
+            itemCount,
+          }));
         }
 
         // Compute totals
@@ -1184,7 +1186,8 @@ function createMcpServer(): Server {
           totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
           ...(byStore && { byStore }),
           ...(storeOrder && { storeOrder }),
-          ...(optimizeRoute && { optimizedBy: 'price' }),
+          ...(recommendedStores && { recommendedStores }),
+          ...(optimizeRoute && { optimizedBy: 'estimated_subtotal' }),
           items: enriched,
         };
 
@@ -1435,19 +1438,25 @@ function createMcpServer(): Server {
         if (includeCosts) {
           recipesWithCosts = await Promise.all(
             recipes.map(async (recipe: any) => {
-              const ingredients: string[] = recipe?.recipeIngredient ?? [];
-              if (ingredients.length === 0) {
+              const rawIngredients = recipe?.recipeIngredient ?? [];
+              const ingredientLines: string[] = rawIngredients
+                .map((ing: any) =>
+                  typeof ing === 'string' ? ing : (ing?.display || ing?.note || ing?.name || String(ing))
+                )
+                .filter((line: string) => line && line.trim());
+
+              if (ingredientLines.length === 0) {
                 return { ...recipe, totalCostEur: null, ingredientCount: 0 };
               }
               const enriched = await enrichIngredients(
-                ingredients.map((note: string) => ({ note, quantity: undefined })),
+                ingredientLines.map((note: string) => ({ note, quantity: undefined })),
                 { skipPrice: false, skipNutrition: true }
               );
               const totalCost = enriched.reduce((sum, e) => sum + (e.estimatedCostEur ?? 0), 0);
               return {
                 ...recipe,
                 totalCostEur: Math.round(totalCost * 100) / 100,
-                ingredientCount: ingredients.length,
+                ingredientCount: ingredientLines.length,
                 perServingCostEur: recipe.recipeServings ? Math.round((totalCost / recipe.recipeServings) * 100) / 100 : undefined
               };
             })

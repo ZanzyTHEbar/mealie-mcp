@@ -38,6 +38,7 @@ export interface ActivityLevelInfo {
 export interface TdeeCalculationResult {
   formula_used: ResolvedTdeeFormula;
   resting_energy_kcal: number;
+  /** Additional resting-energy estimates in kcal/day, not activity-adjusted TDEE values. */
   alternative_estimates?: Partial<Record<ResolvedTdeeFormula, number>>;
   activity_multiplier: number;
   tdee_kcal: number;

@@ -132,6 +132,9 @@ export function calculateTdee(input: TdeeCalculationInput): TdeeCalculationResul
   const assumptions = [
     "Mifflin-St Jeor is used as the default adult resting energy equation unless Cunningham is explicitly requested.",
     "Activity multipliers approximate average daily expenditure from weekly lifestyle and training patterns.",
+    "alternative_estimates report resting-energy references only; they are not activity-adjusted TDEE values.",
+    "tdee_kcal is calculated from the unrounded resting-energy estimate and then rounded to the nearest 5 kcal.",
+    'selected_goal uses fixed presets for "cut" (-500 kcal) and "gain" (+200 kcal), while calorie_targets shows additional reference presets.',
     "Calorie targets should be calibrated against 2 to 4 weeks of body-weight and performance trends.",
   ];
 

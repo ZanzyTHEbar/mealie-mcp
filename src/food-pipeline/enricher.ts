@@ -28,7 +28,7 @@ import {
  *   "600g lamb shoulder, cut into 3cm cubes" -> "lamb shoulder"
  *   "1 can (400g) chickpeas, drained"        -> "chickpeas"
  *   "2 tbsp olive oil"                       -> "olive oil"
- *   "Fresh cilantro and mint"                -> "cilantro"
+ *   "Fresh cilantro and mint"                -> "Fresh cilantro"
  */
 export function extractSearchTerm(note: string): string {
   let text = note.trim();

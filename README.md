@@ -8,7 +8,7 @@ MCP (Model Context Protocol) server generated from the [Mealie](https://mealie.i
 - **StreamableHTTP transport**: HTTP-based MCP so it can be deployed as a web service and used by remote MCP clients.
 - **Configurable base URL**: Set `MEALIE_BASE_URL` or `BASE_URL` to point at your Mealie instance.
 - **Authentication**: Mealie uses OAuth2 password bearer. Set a Mealie API token (or OIDC token) via env.
-- **Nutrition planning**: Includes `nutrition_tdee_calculate` for adult TDEE and calorie-target estimation using Mifflin-St Jeor or Cunningham.
+- **Nutrition planning**: Includes `nutrition_tdee_calculate` for adult TDEE and calorie-target estimation using Mifflin-St Jeor by default and Cunningham when explicitly requested with body-fat data.
 
 ## Quick start (local)
 
@@ -32,6 +32,8 @@ To use a different port, set `PORT` in your env or `.env`.
 | `PORT` | HTTP port (configurable) | `3031` |
 | `MEALIE_BASE_URL` or `BASE_URL` | Mealie instance URL (e.g. `https://mealie.example.com`) | `https://mealie.example.com` |
 | `BEARER_TOKEN_OAUTH2PASSWORDBEARER` or `OAUTH_TOKEN_OAUTH2PASSWORDBEARER` | Mealie API token (from Mealie Admin → API Tokens, or your OIDC access token) | — |
+| `ENRICHMENT_CACHE_ENABLED` | Enable in-memory food enrichment cache | `true` |
+| `ENRICHMENT_CACHE_TTL_HOURS` | Cache TTL for price/nutrition enrichment lookups | `24` |
 
 ## Docker
 
@@ -87,6 +89,8 @@ Inputs:
 - Optional `body_fat_pct` for Cunningham
 - Optional `formula` (`auto`, `mifflin_st_jeor`, `cunningham`)
 - Optional `goal` (`maintain`, `cut`, `gain`, `custom`) and `goal_delta_kcal`
+
+`auto` uses Mifflin-St Jeor as the primary equation. If `body_fat_pct` is provided, Cunningham may be returned under `alternative_estimates` as an additional resting-energy reference, but it is not selected as the primary formula unless `formula: "cunningham"` is passed.
 
 The tool returns resting energy, the applied activity multiplier, estimated TDEE, maintenance and cut/gain targets, normalized input data, and warnings to help agents explain uncertainty clearly.
 
