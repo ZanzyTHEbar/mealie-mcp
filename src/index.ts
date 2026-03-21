@@ -37,6 +37,9 @@ import {
   enrichIngredient,
   enrichIngredients,
   extractSearchTerm,
+  formatIngredientNeed,
+  parseIngredientNeed,
+  scaleIngredientNeed,
 } from './food-pipeline/index.js';
 import {
   addCalendarDays,
@@ -147,7 +150,7 @@ These combine multiple operations into a single call, reducing round-trips:
 - **mealie_start_session** — Initialize a reserved server-side session context. Current composite tools do not consume \`session_id\` yet, so use this only when a downstream integration explicitly supports it.
 
 ### 3. Food Pipeline Tools (Granular control)
-- **food_price_search** — Search Portuguese grocery stores for product prices.
+- **food_price_search** — Search registered Portuguese grocery stores for prices. Response includes \`products\` (with \`normalizedPack\` when parseable) and \`storeOutcomes\` (ok / empty / error / stub_disabled per store).
 - **food_nutrition_lookup** — Look up nutritional data from Open Food Facts.
 - **food_enrich_ingredient** — Enrich a single ingredient with price + nutrition.
 - **food_enrich_shopping_list** — Enrich shopping list with prices + nutrition. Set \`write_back: true\` to save data back to Mealie UI.
@@ -421,7 +424,7 @@ function createMcpServer(): Server {
     // ── Food Pipeline tools ─────────────────────────────────────────────
     {
       name: 'food_price_search',
-      description: 'Search Portuguese grocery stores (Continente.pt) for product prices. Returns product name, price in EUR, brand, unit size, price per unit, promotions, and product image URL. Use for price comparison and shopping budget estimation.',
+      description: 'Search all registered grocery scrapers (Continente, Pingo Doce; Lidl/Aldi stub until implemented). Returns JSON: products (price EUR, unitSize, pricePerUnit, normalizedPack when parseable, image URL) and storeOutcomes per store (ok, empty, error, stub_disabled). Empty product list still includes storeOutcomes for coverage debugging.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -444,7 +447,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'food_enrich_ingredient',
-      description: 'Enrich a single ingredient with both price data (all registered stores) and nutritional info (Open Food Facts) in one call. Automatically cleans the ingredient text (removes quantities, prep instructions) to produce a clean search term. Returns prices, cheapest option, nutrition per 100g, estimated cost, and product image.',
+      description: 'Enrich a single ingredient with price data (registered store scrapers) and Open Food Facts nutrition. Cleans text for search. Returns prices (with normalizedPack when unit strings parse), storeSearchOutcomes per store, cheapest option, estimatedCostEur (pack-scaled when need+pack are parseable), costEstimateBasis, packsUsed, nutrition per 100g, and image.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -647,11 +650,26 @@ function createMcpServer(): Server {
       if (!query) return { content: [{ type: 'text', text: 'Error: "query" is required.' }] };
       const maxResults = Math.min(Math.max(parseInt(String(args.max_results ?? '5'), 10) || 5, 1), 10);
       try {
-        const results = await searchAllStores(query, maxResults);
+        const { results, storeOutcomes } = await searchAllStores(query, maxResults);
+        const payload = { query, products: results, storeOutcomes };
         if (results.length === 0) {
-          return { content: [{ type: 'text', text: `No products found for "${query}" across registered stores.` }] };
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    ...payload,
+                    message: `No product rows for "${query}". See storeOutcomes for per-store status (empty vs error vs stub_disabled).`,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
         }
-        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
       } catch (err: any) {
         return { content: [{ type: 'text', text: `Error searching prices: ${err?.message ?? err}` }] };
       }
@@ -765,6 +783,12 @@ function createMcpServer(): Server {
 
             if (enrichedData.estimatedCostEur != null) {
               extras.estimatedCostEur = enrichedData.estimatedCostEur;
+            }
+            if (enrichedData.costEstimateBasis) {
+              extras.costEstimateBasis = enrichedData.costEstimateBasis;
+            }
+            if (enrichedData.packsUsed != null) {
+              extras.packsUsed = enrichedData.packsUsed;
             }
             if (enrichedData.cheapestPrice) {
               extras.cheapestPrice = {
@@ -1075,18 +1099,24 @@ function createMcpServer(): Server {
         }
 
         // Enrich ingredients
-        const toEnrich = ingredientLines.map((line: string) => ({ note: line, quantity: undefined }));
+        const toEnrich = ingredientLines.map((line: string) => {
+          const scaledNeed = scaleIngredientNeed(parseIngredientNeed(line), scaleFactor);
+          return {
+            note: line,
+            quantity: scaleFactor !== 1 ? formatIngredientNeed(scaledNeed) : undefined,
+          };
+        });
         const enriched = await enrichIngredients(toEnrich, {
           skipPrice: false,
           skipNutrition: !includeNutrition
         });
 
-        // Calculate costs with scaling
+        // Calculate costs directly from the scaled ingredient needs.
         let totalCost = 0;
         let itemsWithPrice = 0;
         for (const e of enriched) {
           if (e.estimatedCostEur != null) {
-            totalCost += e.estimatedCostEur * scaleFactor;
+            totalCost += e.estimatedCostEur;
             itemsWithPrice++;
           }
         }

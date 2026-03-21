@@ -7,19 +7,25 @@
  *
  * Caching: Price and nutrition results are cached with 24h TTL (configurable via
  * ENRICHMENT_CACHE_TTL_HOURS environment variable). Set ENRICHMENT_CACHE_ENABLED=false
- * to disable caching.
+ * to disable caching. Empty price results are cached (negative cache).
  */
 
 import { searchAllStores } from "./scrapers/registry.js";
 import { searchNutrition } from "./nutrition-lookup.js";
 import type { EnrichedItem, PriceResult } from "./types.js";
 import {
-  getCachedPrices,
-  setCachedPrices,
+  getCachedPriceSearch,
+  setCachedPriceSearch,
   getCachedNutrition,
   setCachedNutrition,
   isCacheEnabled,
 } from "./cache.js";
+import {
+  enrichPriceResults,
+  estimateLineCost,
+  parseIngredientNeed,
+  selectBestPriceForNeed,
+} from "./price-normalize.js";
 
 /**
  * Extract a clean search term from a raw shopping-list note.
@@ -67,7 +73,12 @@ export function extractSearchTerm(note: string): string {
 export async function enrichIngredient(
   note: string,
   quantity?: string,
-  options?: { skipPrice?: boolean; skipNutrition?: boolean; maxPriceResults?: number; skipCache?: boolean }
+  options?: {
+    skipPrice?: boolean;
+    skipNutrition?: boolean;
+    maxPriceResults?: number;
+    skipCache?: boolean;
+  }
 ): Promise<EnrichedItem> {
   const searchTerm = extractSearchTerm(note);
   const maxResults = options?.maxPriceResults ?? 3;
@@ -80,35 +91,47 @@ export async function enrichIngredient(
     prices: [],
   };
 
-  // 1. Price lookup (with caching)
+  // 1. Price lookup (with caching, including negative cache)
   if (!options?.skipPrice) {
-    // Check cache first
-    if (useCache) {
-      const cached = getCachedPrices(searchTerm);
-      if (cached !== undefined) {
-        item.prices = cached;
+    const cachedPrice = useCache ? getCachedPriceSearch(searchTerm, maxResults) : undefined;
+
+    if (cachedPrice !== undefined) {
+      item.prices = cachedPrice.prices;
+      item.storeSearchOutcomes = cachedPrice.storeOutcomes;
+      if (item.prices.length > 0) {
+        item.prices = enrichPriceResults(item.prices);
+      }
+    } else {
+      const { results, storeOutcomes } = await searchAllStores(
+        searchTerm,
+        maxResults
+      );
+      item.prices = results;
+      item.storeSearchOutcomes = storeOutcomes;
+      if (useCache) {
+        setCachedPriceSearch(searchTerm, {
+          prices: results,
+          storeOutcomes,
+        }, maxResults);
       }
     }
 
-    // If not cached, fetch and cache
-    if (item.prices.length === 0) {
-      item.prices = await searchAllStores(searchTerm, maxResults);
-      if (useCache && item.prices.length > 0) {
-        setCachedPrices(searchTerm, item.prices);
+    const need = parseIngredientNeed(note, quantity);
+    const selection = selectBestPriceForNeed(item.prices, need);
+    if (selection) {
+      item.cheapestPrice = selection.price;
+      const est = selection.estimate ?? estimateLineCost(item.cheapestPrice, need);
+      item.estimatedCostEur = est.estimatedCostEur;
+      item.costEstimateBasis = est.basis;
+      if (est.packsUsed != null) {
+        item.packsUsed = est.packsUsed;
       }
-    }
-
-    const priced = item.prices.filter((p): p is PriceResult & { priceEur: number } => p.priceEur != null);
-    if (priced.length > 0) {
-      item.cheapestPrice = priced.reduce((a, b) => (a.priceEur < b.priceEur ? a : b));
-      item.estimatedCostEur = item.cheapestPrice.priceEur;
       item.imageUrl = item.cheapestPrice.imageUrl;
     }
   }
 
   // 2. Nutrition lookup (with caching)
   if (!options?.skipNutrition) {
-    // Check cache first
     if (useCache) {
       const cached = getCachedNutrition(searchTerm);
       if (cached !== undefined) {
@@ -116,7 +139,6 @@ export async function enrichIngredient(
       }
     }
 
-    // If not cached, fetch and cache
     if (item.nutrition === undefined) {
       const nutrition = await searchNutrition(searchTerm);
       if (useCache) {
@@ -134,7 +156,11 @@ export async function enrichIngredient(
  */
 export async function enrichIngredients(
   items: Array<{ note: string; quantity?: string }>,
-  options?: { skipPrice?: boolean; skipNutrition?: boolean; maxPriceResults?: number }
+  options?: {
+    skipPrice?: boolean;
+    skipNutrition?: boolean;
+    maxPriceResults?: number;
+  }
 ): Promise<EnrichedItem[]> {
   const results: EnrichedItem[] = [];
   for (const { note, quantity } of items) {

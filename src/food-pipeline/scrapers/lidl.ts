@@ -21,5 +21,6 @@ async function searchLidl(
 
 export const lidlAdapter: GroceryScraperAdapter = {
   name: "Lidl",
+  isStub: true,
   search: searchLidl,
 };

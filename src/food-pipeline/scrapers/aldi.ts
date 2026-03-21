@@ -21,5 +21,6 @@ async function searchAldi(
 
 export const aldiAdapter: GroceryScraperAdapter = {
   name: "Aldi",
+  isStub: true,
   search: searchAldi,
 };

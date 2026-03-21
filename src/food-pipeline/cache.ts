@@ -3,10 +3,18 @@
  *
  * Caches price lookups and nutrition data to avoid repeated
  * scraping/API calls for the same search terms.
+ * Empty price searches are cached (negative cache) like nutrition misses.
  * Default TTL: 24 hours
  */
 
-import type { EnrichedItem, PriceResult, NutritionInfo } from "./types.js";
+import { createHash } from "node:crypto";
+import type { NutritionInfo, PriceResult, StoreSearchOutcome } from "./types.js";
+
+/** Price leg cache value: product rows plus per-store coverage metadata. */
+export interface CachedPriceSearchPayload {
+  prices: PriceResult[];
+  storeOutcomes: StoreSearchOutcome[];
+}
 
 interface CacheEntry<T> {
   value: T;
@@ -25,7 +33,7 @@ interface CacheStats {
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
 // In-memory cache storage
-const priceCache = new Map<string, CacheEntry<PriceResult[]>>();
+const priceCache = new Map<string, CacheEntry<CachedPriceSearchPayload>>();
 const nutritionCache = new Map<string, CacheEntry<NutritionInfo | null>>();
 
 // Cache statistics for monitoring
@@ -51,16 +59,30 @@ function getTTL(): number {
   return DEFAULT_TTL_MS;
 }
 
+const KEY_INLINE_MAX = 220;
+const PRICE_SCOPE = "price";
+const NUTRITION_SCOPE = "nutrition";
+
 /**
  * Generate a cache key from a search term.
- * Normalizes the term for consistent caching.
+ * Long terms use a stable hash to avoid collisions from truncation.
  */
-function generateKey(searchTerm: string): string {
-  return searchTerm
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, " ")
-    .slice(0, 100); // Limit key length
+function generateKey(searchTerm: string, scope: string, variant?: string): string {
+  const normalized = searchTerm.toLowerCase().trim().replace(/\s+/g, " ");
+  const base = variant ? `${scope}|${variant}|${normalized}` : `${scope}|${normalized}`;
+  if (base.length <= KEY_INLINE_MAX) {
+    return base;
+  }
+  return `h:${createHash("sha256").update(base).digest("hex")}`;
+}
+
+function generatePriceKey(searchTerm: string, maxResults: number): string {
+  const bounded = Math.min(Math.max(maxResults, 1), 50);
+  return generateKey(searchTerm, PRICE_SCOPE, `max=${bounded}`);
+}
+
+function generateNutritionKey(searchTerm: string): string {
+  return generateKey(searchTerm, NUTRITION_SCOPE);
 }
 
 /**
@@ -72,11 +94,14 @@ function isValid<T>(entry: CacheEntry<T> | undefined): boolean {
 }
 
 /**
- * Get cached price results for a search term.
- * @returns Cached results or undefined if not found/expired.
+ * Get cached price search (including empty results / negative cache).
+ * @returns Payload or undefined if not found/expired.
  */
-export function getCachedPrices(searchTerm: string): PriceResult[] | undefined {
-  const key = generateKey(searchTerm);
+export function getCachedPriceSearch(
+  searchTerm: string,
+  maxResults = 3
+): CachedPriceSearchPayload | undefined {
+  const key = generatePriceKey(searchTerm, maxResults);
   const entry = priceCache.get(key);
 
   if (entry && isValid(entry)) {
@@ -85,7 +110,6 @@ export function getCachedPrices(searchTerm: string): PriceResult[] | undefined {
     return entry.value;
   }
 
-  // Remove expired entry
   if (entry) {
     priceCache.delete(key);
   }
@@ -94,18 +118,24 @@ export function getCachedPrices(searchTerm: string): PriceResult[] | undefined {
 }
 
 /**
- * Store price results in cache.
+ * Store price search results and per-store outcomes (empty arrays allowed).
  */
-export function setCachedPrices(searchTerm: string, prices: PriceResult[]): void {
-  const key = generateKey(searchTerm);
+export function setCachedPriceSearch(
+  searchTerm: string,
+  payload: CachedPriceSearchPayload,
+  maxResults = 3
+): void {
+  const key = generatePriceKey(searchTerm, maxResults);
   const ttl = getTTL();
 
   priceCache.set(key, {
-    value: prices,
+    value: payload,
     expiresAt: Date.now() + ttl,
   });
 
-  console.log(`[cache] Cached ${prices.length} price results for "${searchTerm}" (TTL: ${ttl / 1000 / 60 / 60}h)`);
+  console.log(
+    `[cache] Cached ${payload.prices.length} price row(s) + ${payload.storeOutcomes.length} store outcome(s) for "${searchTerm}" (TTL: ${ttl / 1000 / 60 / 60}h)`
+  );
   updateStats();
 }
 
@@ -114,7 +144,7 @@ export function setCachedPrices(searchTerm: string, prices: PriceResult[]): void
  * @returns Cached nutrition or undefined if not found/expired.
  */
 export function getCachedNutrition(searchTerm: string): NutritionInfo | null | undefined {
-  const key = generateKey(searchTerm);
+  const key = generateNutritionKey(searchTerm);
   const entry = nutritionCache.get(key);
 
   if (entry && isValid(entry)) {
@@ -136,7 +166,7 @@ export function getCachedNutrition(searchTerm: string): NutritionInfo | null | u
  * Stores null values to cache "not found" results and avoid repeated lookups.
  */
 export function setCachedNutrition(searchTerm: string, nutrition: NutritionInfo | null): void {
-  const key = generateKey(searchTerm);
+  const key = generateNutritionKey(searchTerm);
   const ttl = getTTL();
 
   nutritionCache.set(key, {
@@ -182,9 +212,10 @@ export function getCacheStats(): CacheStats & {
  * Manually invalidate a specific search term.
  */
 export function invalidateCacheEntry(searchTerm: string): void {
-  const key = generateKey(searchTerm);
-  priceCache.delete(key);
-  nutritionCache.delete(key);
+  for (let maxResults = 1; maxResults <= 50; maxResults++) {
+    priceCache.delete(generatePriceKey(searchTerm, maxResults));
+  }
+  nutritionCache.delete(generateNutritionKey(searchTerm));
   console.log(`[cache] Invalidated cache for "${searchTerm}"`);
 }
 

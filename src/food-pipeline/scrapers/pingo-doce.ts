@@ -39,6 +39,24 @@ function parsePriceEur(text: string): number | undefined {
   return isNaN(n) ? undefined : n;
 }
 
+function extractUnitSize(text: string): string | undefined {
+  const compact = text.replace(/\s+/g, " ").trim();
+  const multi = compact.match(/(\d+\s*[x×]\s*[\d.,]+\s*(?:cl|ml|l|g|kg))/i);
+  if (multi?.[1]) return multi[1].replace(/\s*[x×]\s*/i, " x ");
+
+  const single = compact.match(/([\d.,]+\s*(?:kg|g|ml|cl|l|un|uni|unid|unidade)s?\.?)/i);
+  if (single?.[1]) return single[1].trim();
+
+  const pack = compact.match(/((?:pack|embalagem)\s*(?:de\s*)?[\d.,]+)/i);
+  return pack?.[1]?.trim();
+}
+
+function extractPricePerUnit(text: string): string | undefined {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const match = normalized.match(/(\d+[,.]\d+\s*€\s*\/\s*(?:kg|g|l|ml|cl|un))/i);
+  return match?.[1]?.trim();
+}
+
 async function searchPingoDoce(
   query: string,
   maxResults = 3
@@ -132,17 +150,12 @@ async function searchPingoDoce(
       const parent = $(el).closest("div");
       const blockText = parent.text();
 
-      // Look for price patterns - handle multiple prices (use first/lower one)
+      // First € match in tile text is usually the shelf price; avoid min() which can
+      // capture €/kg or promo footnotes that sort lower than the pack price.
       const priceMatches = [...blockText.matchAll(/(\d+[,.]\d+)\s*€/g)];
       let priceEur: number | undefined;
       if (priceMatches.length > 0) {
-        // Parse all prices and use the lowest (usually current price vs. crossed-out original)
-        const prices = priceMatches
-          .map(m => parsePriceEur(m[1]))
-          .filter((p): p is number => p != null);
-        if (prices.length > 0) {
-          priceEur = Math.min(...prices);
-        }
+        priceEur = parsePriceEur(priceMatches[0][1]);
       }
 
       // Validate price range (should be between 0.01 and 10000 EUR for groceries)
@@ -153,11 +166,15 @@ async function searchPingoDoce(
 
       const productName = text.split("\n")[0].trim().slice(0, 120);
       if (!productName) return;
+      const unitSize = extractUnitSize(blockText) ?? extractUnitSize(productName);
+      const pricePerUnit = extractPricePerUnit(blockText);
 
       results.push({
         store: "Pingo Doce",
         productName,
         priceEur,
+        unitSize,
+        pricePerUnit,
         productUrl: fullUrl,
       });
     } catch (parseErr) {

@@ -2,14 +2,34 @@
  * Food pipeline barrel export.
  */
 
-export type { PriceResult, NutritionInfo, EnrichedItem, GroceryScraperAdapter } from "./types.js";
+export type {
+  PriceResult,
+  NutritionInfo,
+  EnrichedItem,
+  GroceryScraperAdapter,
+  StoreSearchOutcome,
+  SearchAllStoresResult,
+  NormalizedPackInfo,
+} from "./types.js";
 export { searchContinente } from "./continente-scraper.js";
 export { getScrapers, registerScraper, searchAllStores } from "./scrapers/registry.js";
 export { searchNutrition, getNutritionByBarcode } from "./nutrition-lookup.js";
 export { extractSearchTerm, enrichIngredient, enrichIngredients } from "./enricher.js";
 export {
-  getCachedPrices,
-  setCachedPrices,
+  parsePackFromUnitSize,
+  parsePricePerUnitDisplay,
+  parseIngredientNeed,
+  scaleIngredientNeed,
+  formatIngredientNeed,
+  normalizePriceResult,
+  enrichPriceResults,
+  estimateLineCost,
+  selectBestPriceForNeed,
+} from "./price-normalize.js";
+export type { CachedPriceSearchPayload } from "./cache.js";
+export {
+  getCachedPriceSearch,
+  setCachedPriceSearch,
   getCachedNutrition,
   setCachedNutrition,
   getCacheStats,

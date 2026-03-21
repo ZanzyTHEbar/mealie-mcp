@@ -2,7 +2,13 @@
  * Registry of grocery store scrapers (adapters).
  * Add new scrapers here so the enricher uses them automatically.
  */
-import type { GroceryScraperAdapter, PriceResult } from "../types.js";
+import type {
+  GroceryScraperAdapter,
+  PriceResult,
+  SearchAllStoresResult,
+  StoreSearchOutcome,
+} from "../types.js";
+import { enrichPriceResults } from "../price-normalize.js";
 import { continenteAdapter } from "./continente.js";
 import { pingoDoceAdapter } from "./pingo-doce.js";
 import { aldiAdapter } from "./aldi.js";
@@ -34,45 +40,80 @@ export function registerScraper(adapter: GroceryScraperAdapter): void {
 
 /**
  * Search all registered stores and merge results (per-store limit applied).
- * Results are ordered by store, then by price ascending when available.
+ * Results are sorted by price ascending when `priceEur` is present, then
+ * normalized with `normalizedPack` where unit strings allow.
  *
  * @param query - Search term (must be non-empty string, max 200 chars)
  * @param maxPerStore - Maximum results per store (1-50, default 3)
- * @returns Array of PriceResult sorted by price ascending
  */
 export async function searchAllStores(
   query: string,
   maxPerStore = 3
-): Promise<PriceResult[]> {
-  // Input validation
-  if (typeof query !== 'string' || !query.trim()) {
-    console.warn('[registry] Empty or invalid query provided to searchAllStores');
-    return [];
+): Promise<SearchAllStoresResult> {
+  if (typeof query !== "string" || !query.trim()) {
+    console.warn("[registry] Empty or invalid query provided to searchAllStores");
+    return { results: [], storeOutcomes: [] };
   }
   const sanitizedQuery = query.trim();
   if (sanitizedQuery.length > 200) {
-    console.warn('[registry] Query exceeds 200 characters, truncating');
+    console.warn("[registry] Query exceeds 200 characters, truncating");
     query = sanitizedQuery.slice(0, 200);
   } else {
     query = sanitizedQuery;
   }
 
-  // Validate maxPerStore bounds
-  let perStore = Math.min(Math.max(maxPerStore, 1), 50);
+  const perStore = Math.min(Math.max(maxPerStore, 1), 50);
 
-  const results = await Promise.all(
-    getScrapers().map(async (s) => {
-      try {
-        return await s.search(query, perStore);
-      } catch (err) {
-        console.error(`[registry] Scraper "${s.name}" failed: ${err instanceof Error ? err.message : String(err)}`);
-        return []; // Return empty on individual scraper failure
+  const pairs = await Promise.all(
+    getScrapers().map(
+      async (
+        s
+      ): Promise<{ rows: PriceResult[]; outcome: StoreSearchOutcome }> => {
+        if (s.isStub === true) {
+          return {
+            rows: [],
+            outcome: {
+              store: s.name,
+              status: "stub_disabled",
+              resultCount: 0,
+            },
+          };
+        }
+        try {
+          const r = await s.search(query, perStore);
+          return {
+            rows: r,
+            outcome: {
+              store: s.name,
+              status: r.length > 0 ? "ok" : "empty",
+              resultCount: r.length,
+            },
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[registry] Scraper "${s.name}" failed: ${msg}`);
+          return {
+            rows: [],
+            outcome: {
+              store: s.name,
+              status: "error",
+              resultCount: 0,
+              errorMessage: msg,
+            },
+          };
+        }
       }
-    })
+    )
   );
-  const merged = results.flat();
-  const withPrice = merged.filter((p): p is PriceResult & { priceEur: number } => p.priceEur != null);
+
+  const merged = pairs.flatMap((p) => p.rows);
+  const storeOutcomes = pairs.map((p) => p.outcome);
+  const withPrice = merged.filter(
+    (p): p is PriceResult & { priceEur: number } => p.priceEur != null
+  );
   const withoutPrice = merged.filter((p) => p.priceEur == null);
   withPrice.sort((a, b) => a.priceEur - b.priceEur);
-  return [...withPrice, ...withoutPrice];
+  const sorted = [...withPrice, ...withoutPrice];
+  const results = enrichPriceResults(sorted);
+  return { results, storeOutcomes };
 }
