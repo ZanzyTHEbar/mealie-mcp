@@ -14,7 +14,13 @@ export type {
 export { searchContinente } from "./continente-scraper.js";
 export { getScrapers, registerScraper, searchAllStores } from "./scrapers/registry.js";
 export { searchNutrition, getNutritionByBarcode } from "./nutrition-lookup.js";
-export { extractSearchTerm, enrichIngredient, enrichIngredients } from "./enricher.js";
+export {
+  buildSearchQueries,
+  extractSearchTerm,
+  normalizeSearchText,
+  scoreSearchMatch,
+} from "./query-normalize.js";
+export { enrichIngredient, enrichIngredients } from "./enricher.js";
 export {
   parsePackFromUnitSize,
   parsePricePerUnitDisplay,

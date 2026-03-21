@@ -26,44 +26,7 @@ import {
   parseIngredientNeed,
   selectBestPriceForNeed,
 } from "./price-normalize.js";
-
-/**
- * Extract a clean search term from a raw shopping-list note.
- *
- * Examples:
- *   "600g lamb shoulder, cut into 3cm cubes" -> "lamb shoulder"
- *   "1 can (400g) chickpeas, drained"        -> "chickpeas"
- *   "2 tbsp olive oil"                       -> "olive oil"
- *   "Fresh cilantro and mint"                -> "Fresh cilantro"
- */
-export function extractSearchTerm(note: string): string {
-  let text = note.trim();
-
-  // Remove leading quantity patterns: "600g", "1 can (400g)", "2 tbsp", "1/2 tsp"
-  text = text.replace(
-    /^[\d/]+\s*(?:g|kg|ml|l|tbsp|tsp|cup|cups|can|cans|bunch|bunches|large|medium|small|cloves?|slices?|stalks?|sheets?)?\s*(?:\([^)]*\))?\s*/i,
-    ""
-  );
-
-  // Remove preparation instructions after comma
-  text = text.split(",")[0].trim();
-
-  // Remove "for serving", "for garnish", etc.
-  text = text.replace(/\bfor\s+\w+$/i, "").trim();
-
-  // Remove "Toppings:", "For tadka:", etc.
-  text = text.replace(/^(?:Toppings|For\s+\w+):\s*/i, "").trim();
-
-  // Take first item if "and" separated
-  if (text.toLowerCase().includes(" and ")) {
-    text = text.split(/ and /i)[0].trim();
-  }
-
-  // Remove trailing parentheticals
-  text = text.replace(/\s*\([^)]*\)\s*$/, "").trim();
-
-  return text || note.trim();
-}
+import { extractSearchTerm } from "./query-normalize.js";
 
 /**
  * Enrich a single ingredient string with price and nutrition data.

@@ -13,7 +13,10 @@ const buildPath = path.join(__dirname, "..", "build", "food-pipeline", "index.js
 async function main() {
   const fp = await import(pathToFileURL(buildPath).href);
   const {
+    buildSearchQueries,
     extractSearchTerm,
+    normalizeSearchText,
+    scoreSearchMatch,
     parsePackFromUnitSize,
     parsePricePerUnitDisplay,
     parseIngredientNeed,
@@ -50,11 +53,23 @@ async function main() {
   eq(extractSearchTerm("600g lamb shoulder, cut into 3cm cubes"), "lamb shoulder", "quantity + prep -> product");
   eq(extractSearchTerm("1 can (400g) chickpeas, drained"), "chickpeas", "can + quantity -> product");
   eq(extractSearchTerm("2 tbsp olive oil"), "olive oil", "tbsp quantity -> product");
-  eq(extractSearchTerm("Fresh cilantro and mint"), "Fresh cilantro", "and -> first item");
+  eq(extractSearchTerm("Fresh cilantro and mint"), "cilantro", "descriptor + and -> first core item");
   eq(extractSearchTerm("quinoa"), "quinoa", "single word");
   eq(extractSearchTerm("  chicken breast  "), "chicken breast", "trim");
   eq(extractSearchTerm("Toppings: cheese"), "cheese", "prefix removed");
   eq(extractSearchTerm("salt (to taste)"), "salt", "trailing parenthetical");
+  eq(extractSearchTerm("extra virgin olive oil"), "olive oil", "leading descriptors removed");
+  eq(extractSearchTerm("emb. 4 x 90 gr iogurte natural"), "iogurte natural", "packaging prefix removed");
+  eq(extractSearchTerm("cebola roxa picada"), "cebola roxa", "trailing prep removed for Portuguese note");
+
+  console.log("\nquery normalization + scoring");
+  eq(normalizeSearchText("Azeite Virgem Extra"), "azeite virgem extra", "normalizeSearchText strips casing/diacritics");
+  eq(JSON.stringify(buildSearchQueries("cebola roxa picada")), JSON.stringify(["cebola roxa", "cebola"]), "buildSearchQueries adds simpler qualifier-free fallback");
+  ok(
+    scoreSearchMatch("azeite", "Azeite Virgem Extra Oliveira") >
+      scoreSearchMatch("azeite", "Arroz Agulha Longo"),
+    "scoreSearchMatch prefers relevant product names"
+  );
 
   console.log("\nparsePackFromUnitSize");
   const p500 = parsePackFromUnitSize("500 g");

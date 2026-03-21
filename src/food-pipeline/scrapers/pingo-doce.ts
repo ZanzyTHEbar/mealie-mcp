@@ -6,6 +6,7 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import type { GroceryScraperAdapter, PriceResult } from "../types.js";
+import { buildSearchQueries, scoreSearchMatch } from "../query-normalize.js";
 
 const BASE_URL = "https://mercadao.pt";
 const SEARCH_URL = `${BASE_URL}/store/pingo-doce/search`;
@@ -75,116 +76,145 @@ async function searchPingoDoce(
     query = sanitizedQuery;
   }
 
-  await throttle();
-  const url = `${SEARCH_URL}?queries=${encodeURIComponent(query)}`;
-  let html: string;
-  try {
-    const resp = await axios.get<string>(url, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-      },
-      timeout: 15_000,
-    });
-    html = resp?.data;
-    if (typeof html !== "string" || !html.trim()) {
-      console.warn(`[pingo-doce] Empty response for query "${query}" - possible rate limiting or blocking`);
-      return [];
-    }
-  } catch (err: any) {
-    const status = err?.response?.status;
-    const statusText = err?.response?.statusText;
-    console.error(`[pingo-doce] HTTP ${status} ${statusText} searching '${query}': ${err?.message}`);
+  const queries = buildSearchQueries(query);
 
-    // Retry on transient errors (429, 502, 503, 504)
-    if ([429, 502, 503, 504].includes(status)) {
-      console.log(`[pingo-doce] Retrying after transient error ${status}...`);
-      await new Promise(r => setTimeout(r, 2000));
-      try {
-        const retryResp = await axios.get<string>(url, {
-          headers: {
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-          },
-          timeout: 15_000,
-        });
-        html = retryResp?.data;
-        if (typeof html !== "string" || !html.trim()) return [];
-      } catch (retryErr: any) {
-        console.error(`[pingo-doce] Retry failed: ${retryErr?.message}`);
-        return [];
-      }
-    } else {
-      return [];
-    }
-  }
-
-  const $ = cheerio.load(html);
-  const results: PriceResult[] = [];
-  const seen = new Set<string>();
-
-  // HTML structure validation
-  const productLinks = $('a[href*="/home/produtos/"]');
-  if (productLinks.length === 0) {
-    console.warn(`[pingo-doce] No product links found for query "${query}" - HTML structure may have changed`);
-    return [];
-  }
-
-  // Mercadão product links: /home/produtos/.../product-name-123.html
-  productLinks.each((_, el) => {
+  for (const candidateQuery of queries) {
+    await throttle();
+    const url = `${SEARCH_URL}?queries=${encodeURIComponent(candidateQuery)}`;
+    let html: string;
     try {
-      if (results.length >= maxResults) return false;
-
-      const href = $(el).attr("href") ?? "";
-      if (!href) return;
-
-      const fullUrl = href.startsWith("http") ? href : `${BASE_URL}${href}`;
-      const text = $(el).text().trim();
-      if (!text || text.length < 2) return;
-
-      // Avoid duplicate URLs
-      const slug = href.split("/").pop() ?? href;
-      if (!slug || seen.has(slug)) return;
-      seen.add(slug);
-
-      // Parent container often has price nearby (e.g. "0,89 €" or "1,38 € 1,85 €")
-      const parent = $(el).closest("div");
-      const blockText = parent.text();
-
-      // First € match in tile text is usually the shelf price; avoid min() which can
-      // capture €/kg or promo footnotes that sort lower than the pack price.
-      const priceMatches = [...blockText.matchAll(/(\d+[,.]\d+)\s*€/g)];
-      let priceEur: number | undefined;
-      if (priceMatches.length > 0) {
-        priceEur = parsePriceEur(priceMatches[0][1]);
-      }
-
-      // Validate price range (should be between 0.01 and 10000 EUR for groceries)
-      if (priceEur != null && (priceEur < 0.01 || priceEur > 10000)) {
-        console.warn(`[pingo-doce] Suspicious price ${priceEur} for "${text.slice(0, 50)}"`);
-        priceEur = undefined;
-      }
-
-      const productName = text.split("\n")[0].trim().slice(0, 120);
-      if (!productName) return;
-      const unitSize = extractUnitSize(blockText) ?? extractUnitSize(productName);
-      const pricePerUnit = extractPricePerUnit(blockText);
-
-      results.push({
-        store: "Pingo Doce",
-        productName,
-        priceEur,
-        unitSize,
-        pricePerUnit,
-        productUrl: fullUrl,
+      const resp = await axios.get<string>(url, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+        },
+        timeout: 15_000,
       });
-    } catch (parseErr) {
-      console.warn(`[pingo-doce] Error parsing product tile: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
-      // Continue with next product
-    }
-  });
+      html = resp?.data;
+      if (typeof html !== "string" || !html.trim()) {
+        console.warn(`[pingo-doce] Empty response for query "${candidateQuery}" - possible rate limiting or blocking`);
+        continue;
+      }
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const statusText = err?.response?.statusText;
+      console.error(`[pingo-doce] HTTP ${status} ${statusText} searching '${candidateQuery}': ${err?.message}`);
 
-  return results;
+      if ([429, 502, 503, 504].includes(status)) {
+        console.log(`[pingo-doce] Retrying after transient error ${status}...`);
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const retryResp = await axios.get<string>(url, {
+            headers: {
+              "User-Agent": USER_AGENT,
+              "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+            },
+            timeout: 15_000,
+          });
+          html = retryResp?.data;
+          if (typeof html !== "string" || !html.trim()) {
+            continue;
+          }
+        } catch (retryErr: any) {
+          console.error(`[pingo-doce] Retry failed: ${retryErr?.message}`);
+          continue;
+        }
+      } else {
+        continue;
+      }
+    }
+
+    const $ = cheerio.load(html);
+    const candidates: Array<PriceResult & { __score: number }> = [];
+    const seen = new Set<string>();
+
+    const productLinks = $('a[href*="/home/produtos/"]');
+    if (productLinks.length === 0) {
+      console.warn(`[pingo-doce] No product links found for query "${candidateQuery}" - HTML structure may have changed`);
+      continue;
+    }
+
+    productLinks.each((_, el) => {
+      try {
+        const href = $(el).attr("href") ?? "";
+        if (!href) return;
+
+        const fullUrl = href.startsWith("http") ? href : `${BASE_URL}${href}`;
+        const text = $(el).text().trim();
+        if (!text || text.length < 2) return;
+
+        const slug = href.split("/").pop() ?? href;
+        if (!slug || seen.has(slug)) return;
+        seen.add(slug);
+
+        const productCard =
+          $(el).closest('article, li, [data-testid*="product"], [class*="product"]').first();
+        const block = productCard.length > 0 ? productCard : $(el).closest("div");
+        const blockText = block.text().replace(/\s+/g, " ").trim();
+
+        const priceMatches = [...blockText.matchAll(/(\d+[,.]\d+)\s*€/g)];
+        let priceEur: number | undefined;
+        if (priceMatches.length > 0) {
+          priceEur = parsePriceEur(priceMatches[0][1]);
+        }
+
+        if (priceEur != null && (priceEur < 0.01 || priceEur > 10000)) {
+          console.warn(`[pingo-doce] Suspicious price ${priceEur} for "${text.slice(0, 50)}"`);
+          priceEur = undefined;
+        }
+
+        const productName = text.split("\n")[0].trim().slice(0, 120);
+        if (!productName) return;
+
+        const unitSize = extractUnitSize(blockText) ?? extractUnitSize(productName);
+        const pricePerUnit = extractPricePerUnit(blockText);
+        const titleScore = scoreSearchMatch(candidateQuery, productName);
+        const slugScore = scoreSearchMatch(candidateQuery, href);
+        const matchScore = Math.max(
+          titleScore,
+          slugScore,
+          scoreSearchMatch(candidateQuery, `${productName} ${blockText}`)
+        );
+
+        if (Math.max(titleScore, slugScore) <= 0) {
+          return;
+        }
+
+        if (priceEur == null && !unitSize && !pricePerUnit && matchScore <= 0) {
+          return;
+        }
+
+        candidates.push({
+          store: "Pingo Doce",
+          productName,
+          priceEur,
+          unitSize,
+          pricePerUnit,
+          productUrl: fullUrl,
+          __score: matchScore,
+        });
+      } catch (parseErr) {
+        console.warn(`[pingo-doce] Error parsing product tile: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+      }
+    });
+
+    const positives = candidates.filter((candidate) => candidate.__score > 0);
+    if (positives.length === 0) {
+      continue;
+    }
+
+    const ranked = positives.sort((a, b) => {
+      if (b.__score !== a.__score) return b.__score - a.__score;
+      const aPrice = a.priceEur ?? Number.POSITIVE_INFINITY;
+      const bPrice = b.priceEur ?? Number.POSITIVE_INFINITY;
+      if (aPrice !== bPrice) return aPrice - bPrice;
+      return a.productName.localeCompare(b.productName, "pt");
+    });
+
+    return ranked.slice(0, maxResults).map(({ __score: _score, ...result }) => result);
+  }
+
+  return [];
 }
 
 export const pingoDoceAdapter: GroceryScraperAdapter = {
