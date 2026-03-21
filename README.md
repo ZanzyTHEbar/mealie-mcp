@@ -77,7 +77,7 @@ npx openapi-mcp-generator \
 
 ## Testing
 
-- **Lint**: `npm run lint` — runs ESLint over the TypeScript source tree.
+- **Lint**: `npm run lint` — runs ESLint over the TypeScript source tree and repo test scripts.
 - **Unit tests** (no network): `npm test` — runs deterministic food-pipeline and nutrition/TDEE tests.
 - **Meal-planning tests**: `npm run test:meal-planning` — validates calendar-safe date handling and ingredient normalization helpers.
 - **Nutrition-only tests**: `npm run test:nutrition` — validates TDEE equations, goal targets, and input validation.
