@@ -54,7 +54,7 @@ Point your MCP client at the StreamableHTTP URL, e.g.:
 - **Cursor**: Add an MCP server with URL `https://mealie-mcp.yourdomain.com/mcp` (if deployed behind HTTPS).
 - **Claude Desktop**: Configure the server URL in your MCP settings.
 
-Session header: `mcp-session-id` (optional; server supports session reuse).
+Session header: `mcp-session-id` (optional; server supports transport/session reuse). This is separate from the `mealie_start_session` tool, which currently reserves server-side context for future integrations rather than powering today's composite tools.
 
 ## Generation
 
@@ -75,6 +75,7 @@ Regenerate after updating the OpenAPI spec (e.g. after a Mealie upgrade).
 ## Testing
 
 - **Unit tests** (no network): `npm test` — runs deterministic food-pipeline and nutrition/TDEE tests.
+- **Meal-planning tests**: `npm run test:meal-planning` — validates calendar-safe date handling and ingredient normalization helpers.
 - **Nutrition-only tests**: `npm run test:nutrition` — validates TDEE equations, goal targets, and input validation.
 - **Live tests** (real HTTP): `npm run test:live` — calls Continente.pt and Open Food Facts to validate the food-pipeline. Use `SKIP_CONTINENTE=1` or `SKIP_NUTRITION=1` to skip flaky endpoints.
 

@@ -38,6 +38,12 @@ import {
   enrichIngredients,
   extractSearchTerm,
 } from './food-pipeline/index.js';
+import {
+  addCalendarDays,
+  normalizeIngredientLines,
+  normalizeMealPlanEntryDate,
+  resolveRequestedStartDate,
+} from './meal-planning/index.js';
 import { calculateTdee, parseTdeeCalculationInput } from './nutrition/index.js';
 
 /**
@@ -77,6 +83,43 @@ export const SERVER_NAME = "mealie-mcp";
 export const SERVER_VERSION = "1.0.0";
 export const API_BASE_URL = process.env.MEALIE_BASE_URL ?? process.env.BASE_URL ?? "https://mealie.example.com";
 
+async function fetchMealPlanEntries(
+  mealieBase: string,
+  token: string,
+  startDate: string,
+  endDate: string,
+): Promise<any[]> {
+  const allItems: any[] = [];
+  const perPage = 100;
+  const maxPages = 50;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const response = await axios.get(`${mealieBase}/api/households/mealplans`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      timeout: 15_000,
+      params: { start_date: startDate, end_date: endDate, page, perPage }
+    });
+
+    const data = response.data ?? {};
+    const pageItems: any[] = data.items ?? data.data ?? [];
+    allItems.push(...pageItems);
+
+    const totalPages = typeof data.totalPages === 'number' && data.totalPages > 0
+      ? data.totalPages
+      : undefined;
+
+    if (totalPages != null && page >= totalPages) {
+      return allItems;
+    }
+
+    if (pageItems.length < perPage) {
+      return allItems;
+    }
+  }
+
+  throw new Error(`Meal plan pagination exceeded ${maxPages} pages. Refine the requested date range.`);
+}
+
 /**
  * Instructions sent to the client when the MCP is loaded. Clients may add this to the system prompt
  * so the model acts as an expert chef/nutritionist/meal planner and uses Mealie tools correctly.
@@ -101,7 +144,7 @@ These combine multiple operations into a single call, reducing round-trips:
 ### 2. Core Mealie API Tools
 - **mealie_registry** — Discover what the Mealie API can do. Call with optional \`query\` filter. Response shows short_id and description for all operations. Registry is cached for 5 minutes for faster responses.
 - **mealie_call** — Run one Mealie operation. Requires \`tool_id\` (exact short_id from registry) and \`params\`. Supports **batch mode**: set \`batch: true\` with an \`operations\` array to execute multiple independent calls in parallel (returns keyed results).
-- **mealie_start_session** — Initialize multi-turn session context. Returns \`session_id\` for maintaining state across multiple interactions. Sessions expire after 30 minutes.
+- **mealie_start_session** — Initialize a reserved server-side session context. Current composite tools do not consume \`session_id\` yet, so use this only when a downstream integration explicitly supports it.
 
 ### 3. Food Pipeline Tools (Granular control)
 - **food_price_search** — Search Portuguese grocery stores for product prices.
@@ -126,7 +169,7 @@ These combine multiple operations into a single call, reducing round-trips:
 - **TDEE / calorie planning**: Use \`nutrition_tdee_calculate\`
 - **Multiple unrelated API calls**: Use \`mealie_call\` with \`batch: true\`
 - **Custom workflows**: Use \`mealie_registry\` → \`mealie_call\`
-- **Multi-turn conversation**: Use \`mealie_start_session\` first
+- **Multi-turn conversation**: Current composite tools do not accept \`session_id\`; use \`mealie_start_session\` only for integrations that explicitly consume it
 
 ## Batch Operations
 Execute multiple independent operations in one round-trip:
@@ -144,7 +187,7 @@ Returns: \`{ results: { recipes: [...], today: [...] }, completed: 2, failed: 0 
 ## Caching Features
 - **Registry cache**: mealie_registry responses cached for 5 minutes
 - **Enrichment cache**: Price/nutrition lookups cached for 24 hours (configurable via ENRICHMENT_CACHE_TTL_HOURS)
-- **Session cache**: Multi-turn session data with 30-minute TTL
+- **Session cache**: Reserved server-side session data with 30-minute TTL; current composite tools do not consume \`session_id\`
 
 ## IMPORTANT: Recipe Import vs Shell Creation
 There are TWO different ways to create recipes:
@@ -497,7 +540,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'mealie_mealplan_with_budget',
-      description: 'Get meal plan with complete budget breakdown and auto-generated shopping list. Fetches meal plan entries, collects all recipe ingredients, removes duplicates across recipes, enriches with prices, and returns total weekly cost plus consolidated shopping list. Set generate_shopping_list=true to get ready-to-shop list, consolidate_ingredients=true to merge duplicates (e.g., "onions" from 3 recipes become single entry with quantities summed).',
+      description: 'Get meal plan with complete budget breakdown and auto-generated shopping list. Fetches meal plan entries, collects all recipe ingredients, removes duplicates across recipes, enriches with prices, and returns total weekly cost plus consolidated shopping list. Set generate_shopping_list=true to get ready-to-shop list, consolidate_ingredients=true to merge duplicates (e.g., "onions" from 3 recipes become single entry with quantities summed). Reports text-only entries, recipes without ingredients, and recipe fetch failures when present.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -505,7 +548,8 @@ function createMcpServer(): Server {
           start_date: { type: 'string', description: 'YYYY-MM-DD (default: today)' },
           generate_shopping_list: { type: 'boolean', description: 'Generate consolidated shopping list (default: true)' },
           consolidate_ingredients: { type: 'boolean', description: 'Merge duplicate ingredients across recipes (default: true)' },
-          include_nutrition: { type: 'boolean', description: 'Include nutrition data (default: false)' }
+          include_nutrition: { type: 'boolean', description: 'Include nutrition data (default: false)' },
+          mealie_token: { type: 'string', description: 'Optional: Mealie API token override for multi-user setups' }
         }
       }
     },
@@ -526,7 +570,7 @@ function createMcpServer(): Server {
     },
     {
       name: 'mealie_start_session',
-      description: 'Initialize a session context for multi-turn operations. Sessions maintain state across multiple tool calls to avoid redundant data fetching. Use for complex workflows like meal planning across multiple interactions. Sessions expire after 30 minutes of inactivity. Returns session_id to pass to subsequent compatible tools.',
+      description: 'Initialize a reserved session context for future multi-turn workflows. The current composite tools do not accept session_id yet, so this is only useful for integrations that explicitly consume the returned value. Sessions expire after 30 minutes of inactivity.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -803,28 +847,15 @@ function createMcpServer(): Server {
         return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
       }
       const days = Math.min(Math.max(parseInt(String(args.days ?? '7'), 10) || 7, 1), 90);
-      let startDate: string;
-      if (typeof args.start_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.start_date.trim())) {
-        startDate = args.start_date.trim();
-      } else {
-        const t = new Date();
-        startDate = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
-      }
-      const endDate = new Date(startDate);
-      endDate.setDate(endDate.getDate() + days);
-      const endDateStr = endDate.getFullYear() + '-' + String(endDate.getMonth() + 1).padStart(2, '0') + '-' + String(endDate.getDate()).padStart(2, '0');
 
       try {
+        const startDate = resolveRequestedStartDate(args.start_date);
+        const endDateStr = addCalendarDays(startDate, days);
         const mealieBase = API_BASE_URL.replace(/\/$/, '');
-        const listResp = await axios.get(`${mealieBase}/api/households/mealplans`, {
-          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-          timeout: 15_000,
-          params: { start_date: startDate, end_date: endDateStr }
-        });
-        const items: any[] = listResp.data?.items ?? listResp.data?.data ?? [];
+        const items = await fetchMealPlanEntries(mealieBase, token, startDate, endDateStr);
         const inRange = items.filter((e: any) => {
-          const d = e.date;
-          return d >= startDate && d < endDateStr;
+          const d = normalizeMealPlanEntryDate(e.date);
+          return d != null && d >= startDate && d < endDateStr;
         });
 
         // Track text-only entries separately
@@ -878,7 +909,7 @@ function createMcpServer(): Server {
           }
           if (!recipe) continue;
 
-          const lines: string[] = recipe?.recipeIngredient ?? [];
+          const lines = normalizeIngredientLines(recipe?.recipeIngredient);
           const recipeName = slugToRecipe.get(slug)?.name ?? slug;
 
           if (lines.length === 0) {
@@ -972,6 +1003,9 @@ function createMcpServer(): Server {
         if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
         if (status === 404) return { content: [{ type: 'text', text: 'Error: Meal plan not found or no entries in the specified date range.' }] };
         if (err?.code === 'ECONNABORTED') return { content: [{ type: 'text', text: 'Error: Request timed out. The Mealie server may be slow or unreachable.' }] };
+        if (err instanceof Error && err.message.includes('Invalid start_date')) {
+          return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+        }
         return { content: [{ type: 'text', text: `Error estimating meal plan cost: ${err?.message ?? err}` }] };
       }
     }
@@ -1023,10 +1057,7 @@ function createMcpServer(): Server {
         const targetServings = servings ?? defaultServings;
 
         // Extract ingredients - handle both string[] and object[] formats
-        const rawIngredients = recipe.recipeIngredient ?? [];
-        const ingredientLines: string[] = rawIngredients.map((ing: any) =>
-          typeof ing === 'string' ? ing : (ing?.display || ing?.note || ing?.name || String(ing))
-        ).filter((line: string) => line && line.trim());
+        const ingredientLines = normalizeIngredientLines(recipe.recipeIngredient);
 
         if (ingredientLines.length === 0) {
           return {
@@ -1207,32 +1238,18 @@ function createMcpServer(): Server {
         return { content: [{ type: 'text', text: 'Error: Mealie API token required. Set BEARER_TOKEN_OAUTH2PASSWORDBEARER or pass mealie_token.' }] };
       }
       const days = Math.min(Math.max(parseInt(String(args.days ?? '7'), 10) || 7, 1), 90);
-      let startDate: string;
-      if (typeof args.start_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.start_date.trim())) {
-        startDate = args.start_date.trim();
-      } else {
-        const t = new Date();
-        startDate = t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
-      }
       const generateShoppingList = args.generate_shopping_list !== false;
       const consolidateIngredients = args.consolidate_ingredients !== false;
       const includeNutrition = args.include_nutrition === true;
-      const endDate = new Date(startDate);
-      endDate.setDate(endDate.getDate() + days);
-      const endDateStr = endDate.getFullYear() + '-' + String(endDate.getMonth() + 1).padStart(2, '0') + '-' + String(endDate.getDate()).padStart(2, '0');
 
       try {
+        const startDate = resolveRequestedStartDate(args.start_date);
+        const endDateStr = addCalendarDays(startDate, days);
         const mealieBase = API_BASE_URL.replace(/\/$/, '');
-        // Fetch meal plan entries
-        const listResp = await axios.get(`${mealieBase}/api/households/mealplans`, {
-          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-          timeout: 15_000,
-          params: { start_date: startDate, end_date: endDateStr }
-        });
-        const items: any[] = listResp.data?.items ?? listResp.data?.data ?? [];
+        const items = await fetchMealPlanEntries(mealieBase, token, startDate, endDateStr);
         const inRange = items.filter((e: any) => {
-          const d = e.date;
-          return d >= startDate && d < endDateStr;
+          const d = normalizeMealPlanEntryDate(e.date);
+          return d != null && d >= startDate && d < endDateStr;
         });
 
         // Track text-only entries and recipes
@@ -1260,8 +1277,9 @@ function createMcpServer(): Server {
               });
               return { slug, recipe: recipeResp.data };
             } catch (err: any) {
-              console.warn(`[mealie_mealplan_with_budget] Failed to fetch recipe ${slug}: ${err?.response?.status} ${err?.message}`);
-              return { slug, recipe: null, error: err?.message };
+              const status = err?.response?.status;
+              console.warn(`[mealie_mealplan_with_budget] Failed to fetch recipe ${slug}: ${status} ${err?.message}`);
+              return { slug, recipe: null, error: `${status ?? 'ERR'}: ${err?.message}` };
             }
           })
         );
@@ -1269,17 +1287,28 @@ function createMcpServer(): Server {
         // Collect all ingredients
         const allIngredients: { note: string; recipeSlug: string; recipeName: string }[] = [];
         const recipeCosts: Map<string, { name: string; slug: string; cost: number; ingredientCount: number }> = new Map();
+        const recipesWithoutIngredients: { slug: string; name: string }[] = [];
+        const failedRecipes: { slug: string; error: string }[] = [];
 
         for (const result of recipeResults) {
-          if (result.status === 'rejected' || !result.value.recipe) continue;
+          if (result.status === 'rejected') {
+            console.warn(`[mealie_mealplan_with_budget] Recipe fetch rejected:`, result.reason);
+            continue;
+          }
+          if (!result.value.recipe) {
+            failedRecipes.push({ slug: result.value.slug, error: result.value.error ?? 'Unknown recipe fetch failure' });
+            continue;
+          }
           const { slug, recipe } = result.value;
           const recipeName = slugToRecipe.get(slug)?.name ?? slug;
-          const lines: string[] = recipe?.recipeIngredient ?? [];
+          const lines = normalizeIngredientLines(recipe?.recipeIngredient);
+
+          if (lines.length === 0) {
+            recipesWithoutIngredients.push({ slug, name: recipeName });
+          }
 
           for (const line of lines) {
-            if (typeof line === 'string' && line.trim()) {
-              allIngredients.push({ note: line.trim(), recipeSlug: slug, recipeName });
-            }
+            allIngredients.push({ note: line, recipeSlug: slug, recipeName });
           }
         }
 
@@ -1293,6 +1322,8 @@ function createMcpServer(): Server {
                 recipesInPeriod: slugs.length,
                 totalCostEur: 0,
                 message: 'No recipe ingredients in the selected meal plan period.',
+                recipesWithoutIngredients: recipesWithoutIngredients.length > 0 ? recipesWithoutIngredients : undefined,
+                failedRecipes: failedRecipes.length > 0 ? failedRecipes : undefined,
                 textOnlyEntries: textOnlyEntries.length > 0 ? textOnlyEntries : undefined,
               }, null, 2)
             }]
@@ -1384,6 +1415,8 @@ function createMcpServer(): Server {
             ingredientCount: r.ingredientCount
           })),
           ...(shoppingList && { shoppingList }),
+          ...(recipesWithoutIngredients.length > 0 && { recipesWithoutIngredientsWarning: recipesWithoutIngredients }),
+          ...(failedRecipes.length > 0 && { failedRecipes }),
           ...(textOnlyEntries.length > 0 && { textOnlyEntries }),
         };
 
@@ -1392,6 +1425,10 @@ function createMcpServer(): Server {
         const status = err?.response?.status;
         if (status === 401 || status === 403) return { content: [{ type: 'text', text: 'Error: Unauthorized. Check Mealie API token.' }] };
         if (status === 404) return { content: [{ type: 'text', text: 'Error: Meal plan not found or no entries in the specified date range.' }] };
+        if (err?.code === 'ECONNABORTED') return { content: [{ type: 'text', text: 'Error: Request timed out. The Mealie server may be slow or unreachable.' }] };
+        if (err instanceof Error && err.message.includes('Invalid start_date')) {
+          return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+        }
         return { content: [{ type: 'text', text: `Error processing meal plan with budget: ${err?.message ?? err}` }] };
       }
     }
@@ -1438,12 +1475,7 @@ function createMcpServer(): Server {
         if (includeCosts) {
           recipesWithCosts = await Promise.all(
             recipes.map(async (recipe: any) => {
-              const rawIngredients = recipe?.recipeIngredient ?? [];
-              const ingredientLines: string[] = rawIngredients
-                .map((ing: any) =>
-                  typeof ing === 'string' ? ing : (ing?.display || ing?.note || ing?.name || String(ing))
-                )
-                .filter((line: string) => line && line.trim());
+              const ingredientLines = normalizeIngredientLines(recipe?.recipeIngredient);
 
               if (ingredientLines.length === 0) {
                 return { ...recipe, totalCostEur: null, ingredientCount: 0 };
@@ -1511,7 +1543,7 @@ function createMcpServer(): Server {
               ttlMinutes: stats.ttlMinutes,
               activeSessions: stats.activeSessions,
               maxSessions: stats.maxSessions,
-              note: `Pass this session_id to compatible tools for multi-turn context. Session expires after ${stats.ttlMinutes} minutes of inactivity.`
+              note: `Session expires after ${stats.ttlMinutes} minutes of inactivity. Current composite tools do not accept session_id yet, so only use this with integrations that explicitly consume it.`
             }, null, 2)
           }]
         };
