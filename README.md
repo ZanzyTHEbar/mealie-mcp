@@ -61,23 +61,35 @@ Session header: `mcp-session-id` (optional; server supports transport/session re
 This server was generated with [openapi-mcp-generator](https://github.com/harsha-iiiv/openapi-mcp-generator):
 
 ```bash
+# First export or copy a Mealie OpenAPI document to a local path, e.g.
+# /tmp/mealie-openapi.json
+# Then run from the repository root:
 npx openapi-mcp-generator \
-  --input mealie-openapi.json \
-  --output mealie-mcp \
+  --input /tmp/mealie-openapi.json \
+  --output . \
   --base-url https://mealie.example.com \
   --server-name mealie-mcp \
   --transport streamable-http \
   --port 3031
 ```
 
-Regenerate after updating the OpenAPI spec (e.g. after a Mealie upgrade).
+`mealie-openapi.json` is not tracked in this repository. Regenerate after updating the Mealie spec, then review the diff before committing so local custom tools and docs are not overwritten blindly.
 
 ## Testing
 
+- **Lint**: `npm run lint` — runs ESLint over the TypeScript source tree.
 - **Unit tests** (no network): `npm test` — runs deterministic food-pipeline and nutrition/TDEE tests.
 - **Meal-planning tests**: `npm run test:meal-planning` — validates calendar-safe date handling and ingredient normalization helpers.
 - **Nutrition-only tests**: `npm run test:nutrition` — validates TDEE equations, goal targets, and input validation.
 - **Live tests** (real HTTP): `npm run test:live` — calls Continente.pt and Open Food Facts to validate the food-pipeline. Use `SKIP_CONTINENTE=1` or `SKIP_NUTRITION=1` to skip flaky endpoints.
+
+## Grocery Scrapers
+
+Registered store scrapers live under `src/food-pipeline/scrapers/` and are assembled in `src/food-pipeline/scrapers/registry.ts`.
+
+- Mark unfinished adapters with `isStub: true` so MCP responses emit `stub_disabled` instead of pretending the store returned a real empty result.
+- Remove `isStub` only when `search()` is implemented and returning real `PriceResult[]` rows.
+- `food_price_search` and the enrichment tools surface per-store outcome metadata so callers can distinguish `ok`, `empty`, `error`, and `stub_disabled`.
 
 ## Custom nutrition tool
 

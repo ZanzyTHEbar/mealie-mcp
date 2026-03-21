@@ -9,7 +9,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -36,7 +35,6 @@ import {
   getNutritionByBarcode,
   enrichIngredient,
   enrichIngredients,
-  extractSearchTerm,
   formatIngredientNeed,
   parseIngredientNeed,
   scaleIngredientNeed,
@@ -367,21 +365,6 @@ I'll start by discovering the relevant operations now.`
 /**
  * MCP Server instance
  */
-/**
- * Ensure inputSchema has type: 'object' at root so MCP clients (e.g. Cursor) accept the tool.
- * Some generated schemas may have anyOf/oneOf at root and get rejected.
- */
-function normalizeToolInputSchema(schema: unknown): Tool['inputSchema'] {
-  if (schema && typeof schema === 'object' && 'type' in schema && (schema as { type: string }).type === 'object') {
-    const s = schema as { type: string; properties?: Record<string, object>; required?: string[] };
-    return {
-      type: 'object',
-      ...(s.properties && Object.keys(s.properties).length > 0 && { properties: s.properties }),
-      ...(s.required && s.required.length > 0 && { required: s.required })
-    };
-  }
-  return { type: 'object', properties: {} };
-}
 
 /**
  * Creates a new MCP Server instance (one per connection).
@@ -1655,13 +1638,6 @@ function getRelevance(pathTemplate: string, method: string, operationKey: string
 
   // Default: allow but rank low (e.g. test scrape URL, get recipe as format)
   return 'low';
-}
-
-/**
- * Whether a tool is exposed to the agent (high, medium, low). Excluded tools are not in the registry or callable.
- */
-function isToolAllowed(relevance: ToolRelevance): boolean {
-  return relevance !== 'exclude';
 }
 
 /** One row for the ranked tool list (for documentation). */
@@ -4522,7 +4498,7 @@ async function executeApiTool(
     // Security requirements use OR between array items and AND within each object
     const appliedSecurity = definition.securityRequirements?.find(req => {
       // Try each security requirement (combined with OR)
-      return Object.entries(req).every(([schemeName, scopesArray]) => {
+      return Object.entries(req).every(([schemeName]) => {
         const scheme = allSecuritySchemes[schemeName];
         if (!scheme) return false;
 
@@ -4697,7 +4673,7 @@ async function executeApiTool(
     if (contentType.includes('application/json') && typeof response.data === 'object' && response.data !== null) {
       try {
         responseText = JSON.stringify(response.data, null, 2);
-      } catch (e) {
+      } catch {
         responseText = "[Stringify Error]";
       }
     }

@@ -2,6 +2,7 @@
   "name": "mealie-mcp",
   "version": "1.0.0",
   "description": "MCP Server generated from OpenAPI spec for mealie-mcp",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "main": "build/index.js",
@@ -12,6 +13,7 @@
   "scripts": {
     "start": "node build/index.js",
     "build": "tsc && chmod 755 build/index.js",
+    "lint": "eslint \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit",
     "prestart": "npm run build",
     "start:http": "node build/index.js --transport=streamable-http",
@@ -39,6 +41,10 @@
   "devDependencies": {
     "@types/node": "^22.15.2",
     "@types/uuid": "^10.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.57.1",
+    "@typescript-eslint/parser": "^8.57.1",
+    "eslint": "^10.1.0",
+    "globals": "^17.4.0",
     "typescript": "^5.8.3"
   }
 }

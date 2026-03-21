@@ -12,7 +12,7 @@
 
 import { searchAllStores } from "./scrapers/registry.js";
 import { searchNutrition } from "./nutrition-lookup.js";
-import type { EnrichedItem, PriceResult } from "./types.js";
+import type { EnrichedItem } from "./types.js";
 import {
   getCachedPriceSearch,
   setCachedPriceSearch,

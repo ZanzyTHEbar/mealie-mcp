@@ -258,7 +258,7 @@ export async function setupStreamableHttpServer(createServer: McpServerFactory, 
             headers: { 'Content-Type': contentType }
           });
         }
-      } catch (err) {
+      } catch {
         // File not found or other error
         return c.text('Not Found', 404);
       }

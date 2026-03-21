@@ -44,7 +44,7 @@ async function throttle(): Promise<void> {
   await throttlePromise;
 }
 
-function parseTile(el: cheerio.Cheerio<any>, $: cheerio.CheerioAPI): PriceResult | null {
+function parseTile(el: cheerio.Cheerio<any>, _$: cheerio.CheerioAPI): PriceResult | null {
   // Embedded JSON in data-product-tile-impression
   let productData: Record<string, any> = {};
   const jsonEl = el.find("[data-product-tile-impression]").first();
