@@ -41,13 +41,14 @@ function parsePriceEur(text: string): number | undefined {
 
 function extractUnitSize(text: string): string | undefined {
   const compact = text.replace(/\s+/g, " ").trim();
-  const multi = compact.match(/(\d+\s*[x×]\s*[\d.,]+\s*(?:cl|ml|l|g|kg))/i);
+  const numeric = String.raw`\d+(?:[.,]\d+)?`;
+  const multi = compact.match(new RegExp(`(${numeric}\\s*[x×]\\s*${numeric}\\s*(?:cl|ml|l|g|kg))`, "i"));
   if (multi?.[1]) return multi[1].replace(/\s*[x×]\s*/i, " x ");
 
-  const single = compact.match(/([\d.,]+\s*(?:kg|g|ml|cl|l|un|uni|unid|unidade)s?\.?)/i);
+  const single = compact.match(new RegExp(`(${numeric}\\s*(?:kg|g|ml|cl|l|un|uni|unid|unidade)s?\\.?)`, "i"));
   if (single?.[1]) return single[1].trim();
 
-  const pack = compact.match(/((?:pack|embalagem)\s*(?:de\s*)?[\d.,]+)/i);
+  const pack = compact.match(new RegExp(`((?:pack|embalagem)\\s*(?:de\\s*)?${numeric})`, "i"));
   return pack?.[1]?.trim();
 }
 
