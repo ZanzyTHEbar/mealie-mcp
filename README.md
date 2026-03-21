@@ -8,6 +8,7 @@ MCP (Model Context Protocol) server generated from the [Mealie](https://mealie.i
 - **StreamableHTTP transport**: HTTP-based MCP so it can be deployed as a web service and used by remote MCP clients.
 - **Configurable base URL**: Set `MEALIE_BASE_URL` or `BASE_URL` to point at your Mealie instance.
 - **Authentication**: Mealie uses OAuth2 password bearer. Set a Mealie API token (or OIDC token) via env.
+- **Nutrition planning**: Includes `nutrition_tdee_calculate` for adult TDEE and calorie-target estimation using Mifflin-St Jeor or Cunningham.
 
 ## Quick start (local)
 
@@ -71,8 +72,23 @@ Regenerate after updating the OpenAPI spec (e.g. after a Mealie upgrade).
 
 ## Testing
 
-- **Unit tests** (no network): `npm test` — runs `extractSearchTerm` and food-pipeline unit tests.
+- **Unit tests** (no network): `npm test` — runs deterministic food-pipeline and nutrition/TDEE tests.
+- **Nutrition-only tests**: `npm run test:nutrition` — validates TDEE equations, goal targets, and input validation.
 - **Live tests** (real HTTP): `npm run test:live` — calls Continente.pt and Open Food Facts to validate the food-pipeline. Use `SKIP_CONTINENTE=1` or `SKIP_NUTRITION=1` to skip flaky endpoints.
+
+## Custom nutrition tool
+
+`nutrition_tdee_calculate` is a pure-computation MCP tool, so it does not require Mealie credentials.
+
+Inputs:
+
+- `age_years`, `sex_for_formula`, `height_cm`, `weight_kg`, `activity_level`
+- Optional `activity_multiplier` for `activity_level: "custom"`
+- Optional `body_fat_pct` for Cunningham
+- Optional `formula` (`auto`, `mifflin_st_jeor`, `cunningham`)
+- Optional `goal` (`maintain`, `cut`, `gain`, `custom`) and `goal_delta_kcal`
+
+The tool returns resting energy, the applied activity multiplier, estimated TDEE, maintenance and cut/gain targets, normalized input data, and warnings to help agents explain uncertainty clearly.
 
 ## License
 

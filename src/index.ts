@@ -38,6 +38,7 @@ import {
   enrichIngredients,
   extractSearchTerm,
 } from './food-pipeline/index.js';
+import { calculateTdee, parseTdeeCalculationInput } from './nutrition/index.js';
 
 /**
  * Type definition for JSON objects
@@ -109,6 +110,9 @@ These combine multiple operations into a single call, reducing round-trips:
 - **food_enrich_shopping_list** — Enrich shopping list with prices + nutrition. Set \`write_back: true\` to save data back to Mealie UI.
 - **food_estimate_mealplan_cost** — Estimate meal plan cost with breakdown.
 
+### 4. Nutrition Planning Tools
+- **nutrition_tdee_calculate** — Estimate adult maintenance calories (TDEE) plus cut/gain targets using validated activity multipliers. Defaults to Mifflin-St Jeor and can use Cunningham when body-fat data is available.
+
 ## Workflow (discover → reason → act)
 1. **Discover** — If needed, call mealie_registry (with a focused \`query\`) and read the short_ids.
 2. **Reason** — State in one sentence what you will do and which operation(s) you will use.
@@ -119,6 +123,7 @@ These combine multiple operations into a single call, reducing round-trips:
 - **Weekly meal planning**: Use \`mealie_mealplan_with_budget\`
 - **Shopping trip optimization**: Use \`mealie_smart_shopping_list\`
 - **Browse by budget**: Use \`mealie_recipes_with_costs\`
+- **TDEE / calorie planning**: Use \`nutrition_tdee_calculate\`
 - **Multiple unrelated API calls**: Use \`mealie_call\` with \`batch: true\`
 - **Custom workflows**: Use \`mealie_registry\` → \`mealie_call\`
 - **Multi-turn conversation**: Use \`mealie_start_session\` first
@@ -438,6 +443,26 @@ function createMcpServer(): Server {
           mealie_token: { type: 'string', description: 'Optional: Mealie API token override for multi-user setups' }
         },
         required: []
+      }
+    },
+    {
+      name: 'nutrition_tdee_calculate',
+      description: 'Calculate adult TDEE (total daily energy expenditure) and calorie targets for maintenance, cutting, or gaining. Uses Mifflin-St Jeor by default and Cunningham when body-fat percentage is supplied and requested. Returns resting energy, activity multiplier, maintenance calories, recommended target ranges, assumptions, and warnings.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          age_years: { type: 'number', description: 'Adult age in years (18-100).' },
+          sex_for_formula: { type: 'string', enum: ['male', 'female'], description: 'Sex used by the predictive equation.' },
+          height_cm: { type: 'number', description: 'Body height in centimeters.' },
+          weight_kg: { type: 'number', description: 'Body weight in kilograms.' },
+          activity_level: { type: 'string', enum: ['sedentary', 'light', 'moderate', 'active', 'very_active', 'custom'], description: 'Lifestyle/training multiplier bucket. Use custom only when supplying activity_multiplier.' },
+          activity_multiplier: { type: 'number', description: 'Custom activity multiplier (required only when activity_level is custom).' },
+          body_fat_pct: { type: 'number', description: 'Optional body-fat percentage. Required for Cunningham.' },
+          formula: { type: 'string', enum: ['auto', 'mifflin_st_jeor', 'cunningham'], description: 'Energy equation. auto defaults to Mifflin-St Jeor and includes Cunningham as an alternative when body-fat is available.' },
+          goal: { type: 'string', enum: ['maintain', 'cut', 'gain', 'custom'], description: 'Primary calorie goal. custom requires goal_delta_kcal.' },
+          goal_delta_kcal: { type: 'number', description: 'Custom daily calorie delta relative to TDEE, such as -300 or +200.' }
+        },
+        required: ['age_years', 'sex_for_formula', 'height_cm', 'weight_kg', 'activity_level']
       }
     },
     // ── Composite High-Intent Tools ───────────────────────────────────
@@ -948,6 +973,22 @@ function createMcpServer(): Server {
         if (status === 404) return { content: [{ type: 'text', text: 'Error: Meal plan not found or no entries in the specified date range.' }] };
         if (err?.code === 'ECONNABORTED') return { content: [{ type: 'text', text: 'Error: Request timed out. The Mealie server may be slow or unreachable.' }] };
         return { content: [{ type: 'text', text: `Error estimating meal plan cost: ${err?.message ?? err}` }] };
+      }
+    }
+
+    if (toolName === 'nutrition_tdee_calculate') {
+      try {
+        const parsed = parseTdeeCalculationInput(args);
+        const result = calculateTdee(parsed);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (err: unknown) {
+        if (err instanceof ZodError) {
+          const details = err.issues
+            .map((issue) => `${issue.path.join('.') || 'input'}: ${issue.message}`)
+            .join('; ');
+          return { content: [{ type: 'text', text: `Error: Invalid TDEE input. ${details}` }] };
+        }
+        return { content: [{ type: 'text', text: `Error calculating TDEE: ${err instanceof Error ? err.message : String(err)}` }] };
       }
     }
 
@@ -1471,7 +1512,7 @@ function createMcpServer(): Server {
     }
 
     console.error(`Error: Unknown tool requested: ${toolName}`);
-    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Available tools: mealie_registry, mealie_call, mealie_start_session, mealie_recipe_with_cost, mealie_smart_shopping_list, mealie_mealplan_with_budget, mealie_recipes_with_costs, food_price_search, food_nutrition_lookup, food_enrich_ingredient, food_enrich_shopping_list, food_estimate_mealplan_cost.` }] };
+    return { content: [{ type: 'text', text: `Error: Unknown tool requested: ${toolName}. Available tools: mealie_registry, mealie_call, mealie_start_session, mealie_recipe_with_cost, mealie_smart_shopping_list, mealie_mealplan_with_budget, mealie_recipes_with_costs, food_price_search, food_nutrition_lookup, food_enrich_ingredient, food_enrich_shopping_list, food_estimate_mealplan_cost, nutrition_tdee_calculate.` }] };
   });
   return s;
 }

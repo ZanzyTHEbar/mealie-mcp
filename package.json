@@ -16,7 +16,8 @@
     "prestart": "npm run build",
     "start:http": "node build/index.js --transport=streamable-http",
     "dump-ranking": "npm run build && node build/index.js --dump-ranking",
-    "test": "npm run build && node scripts/test-food-pipeline.mjs",
+    "test": "npm run build && node scripts/test-food-pipeline.mjs && node scripts/test-nutrition.mjs",
+    "test:nutrition": "npm run build && node scripts/test-nutrition.mjs",
     "test:live": "npm run build && node scripts/test-food-pipeline-live.mjs"
   },
   "engines": {
