@@ -11,10 +11,42 @@ export interface IngredientNeed {
   each?: number;
 }
 
+export interface ParseIngredientNeedOptions {
+  /**
+   * Allow a quantity string that is only a number (e.g. Mealie `quantity: 2` without unit)
+   * to mean N discrete items. Never applied to free-text recipe notes unless passed explicitly.
+   */
+  mealiePlainEach?: boolean;
+  /**
+   * When true and the full ingredient `note` matches a liquid hint, leading tbsp/tsp/cup
+   * on the note line convert to ml (metric cup = 250 ml, tbsp = 15 ml, tsp = 5 ml).
+   * Enable via `ENRICHMENT_LIQUID_VOLUME_CONV` in the enricher.
+   */
+  liquidVolumeConversions?: boolean;
+}
+
 const LEADING_AMOUNT_UNIT =
   /^[\s]*([\d.,/]+)\s*(g|gr|kg|ml|mL|l|L|cl|Cl)\b/i;
+
+/** Explicit count + unit: 3 un, 2 pcs, 4 unidades */
+const LEADING_COUNT_WITH_UNIT =
+  /^[\s]*([\d.,/]+)\s*(un|uni|unid\.?|unidades?|pcs?|pieces?)\b/i;
+
 const LEADING_COUNT =
   /^[\s]*([\d.,/]+)\s+(?!g\b|kg\b|ml\b|mL\b|l\b|L\b|cl\b|tbsp\b|tsp\b|cup\b|cups\b|can\b|cans\b|bunch\b|bunches\b|large\b|medium\b|small\b|cloves?\b|slices?\b|stalks?\b|sheets?\b)([\p{L}][\p{L}\- ]*)/iu;
+
+/** Liquid hint on full note (for imperial volume conversion). */
+const LIQUID_HINT =
+  /\b(oil|óleo|azeite|milk|leite|water|água|vinegar|vinagre|stock|broth|caldo|wine|vinho|syrup|xarope|juice|sumo|cream|nata|molho|sauce)\b/i;
+
+/** Feature-flag imperial volume → ml on liquid ingredient lines (enricher + callers). */
+export function isLiquidVolumeConversionEnabled(): boolean {
+  const v = process.env.ENRICHMENT_LIQUID_VOLUME_CONV?.toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
+
+const LEADING_IMPERIAL_VOLUME =
+  /^[\s]*([\d.,/]+)\s*(tbsp|tablespoons?|tsp|teaspoons?|cup|cups)\b/i;
 
 function parseFloatLoose(raw: string): number | undefined {
   const s = raw.replace(",", ".").trim();
@@ -49,11 +81,34 @@ export function parseLeadingAmountUnit(text: string): { value: number; unit: str
   return { value, unit: m[2] };
 }
 
+function parseLeadingImperialVolumeMl(s: string): number | null {
+  const m = s.trim().match(LEADING_IMPERIAL_VOLUME);
+  if (!m) return null;
+  const v = parseFloatLoose(m[1]);
+  if (v == null || v <= 0) return null;
+  const u = m[2].toLowerCase();
+  const cupMl = 250;
+  const tbspMl = 15;
+  const tspMl = 5;
+  if (u.startsWith("cup")) return v * cupMl;
+  if (u.startsWith("tbsp") || u.startsWith("tablespoon")) return v * tbspMl;
+  if (u.startsWith("tsp") || u.startsWith("teaspoon")) return v * tspMl;
+  return null;
+}
+
 /**
  * Derive grams/ml/each from Mealie quantity and/or the raw ingredient note.
+ *
+ * Plain numbers like "2" alone are **not** interpreted as `each` on the **note** line
+ * (too ambiguous). They are accepted only for the `quantity` string when
+ * `options.mealiePlainEach` is true (structured Mealie shopping / recipe quantity).
  */
-export function parseIngredientNeed(note: string, quantity?: string): IngredientNeed | null {
-  const tryOne = (s: string): IngredientNeed | null => {
+export function parseIngredientNeed(
+  note: string,
+  quantity?: string,
+  options?: ParseIngredientNeedOptions
+): IngredientNeed | null {
+  const tryOne = (s: string, source: "note" | "quantity"): IngredientNeed | null => {
     const lu = parseLeadingAmountUnit(s);
     if (lu) {
       const c = toGramsOrMl(lu.value, lu.unit);
@@ -61,13 +116,26 @@ export function parseIngredientNeed(note: string, quantity?: string): Ingredient
         return { grams: c.grams, ml: c.ml };
       }
     }
-    const plain = s.trim().match(/^([\d.,/]+)\s*$/);
-    if (plain) {
-      const n = parseFloatLoose(plain[1]);
+
+    if (
+      options?.liquidVolumeConversions === true &&
+      source === "note" &&
+      LIQUID_HINT.test(note)
+    ) {
+      const ml = parseLeadingImperialVolumeMl(s);
+      if (ml != null) {
+        return { ml };
+      }
+    }
+
+    const countUnit = s.trim().match(LEADING_COUNT_WITH_UNIT);
+    if (countUnit) {
+      const n = parseFloatLoose(countUnit[1]);
       if (n != null && n > 0) {
         return { each: n };
       }
     }
+
     const counted = s.trim().match(LEADING_COUNT);
     if (counted) {
       const n = parseFloatLoose(counted[1]);
@@ -75,14 +143,25 @@ export function parseIngredientNeed(note: string, quantity?: string): Ingredient
         return { each: n };
       }
     }
+
+    if (source === "quantity" && options?.mealiePlainEach === true) {
+      const plain = s.trim().match(/^([\d.,/]+)\s*$/);
+      if (plain) {
+        const n = parseFloatLoose(plain[1]);
+        if (n != null && n > 0) {
+          return { each: n };
+        }
+      }
+    }
+
     return null;
   };
 
   if (quantity?.trim()) {
-    const q = tryOne(quantity);
+    const q = tryOne(quantity, "quantity");
     if (q) return q;
   }
-  return tryOne(note);
+  return tryOne(note, "note");
 }
 
 /**
@@ -248,6 +327,18 @@ export interface LineCostEstimate {
   packsUsed?: number;
 }
 
+/**
+ * ## Line cost estimate policy (ambiguity)
+ *
+ * - **Mass/volume scaling** (`pack_scale_grams`, `pack_scale_ml`): when both parsed need and
+ *   pack net size exist, use ceil(need/pack)×sticker.
+ * - **Per-kg / per-liter without sticker**: derive from normalized shelf metadata when possible.
+ * - **each × unitCount**: multipack `unitCount` without `packGrams`/`packMl` is ambiguous
+ *   (yogurt 6-pack vs six discrete items). We **do not** scale; return **sticker** with
+ *   `sticker_each_vs_multipack_ambiguous`.
+ * - **Fallback**: `sticker_unscaled` when need exists but cannot be mapped safely.
+ */
+
 export function scaleIngredientNeed(
   need: IngredientNeed | null,
   factor: number
@@ -317,6 +408,12 @@ export function estimateLineCost(price: PriceResult, need: IngredientNeed | null
   }
 
   if (need.each != null && norm?.unitCount != null && norm.unitCount > 0) {
+    if (norm.packGrams == null && norm.packMl == null) {
+      return {
+        estimatedCostEur: sticker,
+        basis: "sticker_each_vs_multipack_ambiguous",
+      };
+    }
     const packs = Math.max(1, Math.ceil(need.each / norm.unitCount));
     return {
       estimatedCostEur: packs * sticker,

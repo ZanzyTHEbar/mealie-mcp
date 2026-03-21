@@ -63,6 +63,24 @@ const KEY_INLINE_MAX = 220;
 const PRICE_SCOPE = "price";
 const NUTRITION_SCOPE = "nutrition";
 
+/** Bump via env after breaking price-parser or cache payload shape changes. */
+function getActivePriceSchemaVersion(): string {
+  const v = process.env.ENRICHMENT_CACHE_SCHEMA_VERSION?.trim();
+  return v && v.length > 0 ? v : "0";
+}
+
+function priceCacheSchemaVariantsForInvalidation(): string[] {
+  const s = new Set<string>();
+  for (let i = 0; i <= 64; i++) {
+    s.add(String(i));
+  }
+  const e = process.env.ENRICHMENT_CACHE_SCHEMA_VERSION?.trim();
+  if (e) {
+    s.add(e);
+  }
+  return [...s];
+}
+
 /**
  * Generate a cache key from a search term.
  * Long terms use a stable hash to avoid collisions from truncation.
@@ -76,9 +94,17 @@ function generateKey(searchTerm: string, scope: string, variant?: string): strin
   return `h:${createHash("sha256").update(base).digest("hex")}`;
 }
 
-function generatePriceKey(searchTerm: string, maxResults: number): string {
+function generatePriceKeyWithSchema(
+  searchTerm: string,
+  maxResults: number,
+  schemaVersion: string
+): string {
   const bounded = Math.min(Math.max(maxResults, 1), 50);
-  return generateKey(searchTerm, PRICE_SCOPE, `max=${bounded}`);
+  return generateKey(searchTerm, PRICE_SCOPE, `v=${schemaVersion}|max=${bounded}`);
+}
+
+function generatePriceKey(searchTerm: string, maxResults: number): string {
+  return generatePriceKeyWithSchema(searchTerm, maxResults, getActivePriceSchemaVersion());
 }
 
 function generateNutritionKey(searchTerm: string): string {
@@ -212,8 +238,10 @@ export function getCacheStats(): CacheStats & {
  * Manually invalidate a specific search term.
  */
 export function invalidateCacheEntry(searchTerm: string): void {
-  for (let maxResults = 1; maxResults <= 50; maxResults++) {
-    priceCache.delete(generatePriceKey(searchTerm, maxResults));
+  for (const schema of priceCacheSchemaVariantsForInvalidation()) {
+    for (let maxResults = 1; maxResults <= 50; maxResults++) {
+      priceCache.delete(generatePriceKeyWithSchema(searchTerm, maxResults, schema));
+    }
   }
   nutritionCache.delete(generateNutritionKey(searchTerm));
   console.log(`[cache] Invalidated cache for "${searchTerm}"`);

@@ -20,7 +20,22 @@ export {
   normalizeSearchText,
   scoreSearchMatch,
 } from "./query-normalize.js";
-export { enrichIngredient, enrichIngredients } from "./enricher.js";
+export {
+  enrichIngredient,
+  enrichIngredientLine,
+  enrichIngredients,
+  scaleEnrichmentLinesForServings,
+} from "./enricher.js";
+export type { EnrichmentLineInput } from "./mealie-enrichment-input.js";
+export {
+  enrichmentLineFromShoppingListItem,
+  enrichmentLinesFromRecipeIngredients,
+} from "./mealie-enrichment-input.js";
+export {
+  summarizePriceCoverageForEnriched,
+  rollupStoreOutcomes,
+  degradedStoreNames,
+} from "./coverage.js";
 export {
   parsePackFromUnitSize,
   parsePricePerUnitDisplay,
@@ -31,6 +46,7 @@ export {
   enrichPriceResults,
   estimateLineCost,
   selectBestPriceForNeed,
+  isLiquidVolumeConversionEnabled,
 } from "./price-normalize.js";
 export type { CachedPriceSearchPayload } from "./cache.js";
 export {

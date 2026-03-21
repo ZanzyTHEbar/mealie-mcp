@@ -67,7 +67,7 @@ async function main() {
   eq(JSON.stringify(buildSearchQueries("cebola roxa picada")), JSON.stringify(["cebola roxa", "cebola"]), "buildSearchQueries adds simpler qualifier-free fallback");
   ok(
     scoreSearchMatch("azeite", "Azeite Virgem Extra Oliveira") >
-      scoreSearchMatch("azeite", "Arroz Agulha Longo"),
+    scoreSearchMatch("azeite", "Arroz Agulha Longo"),
     "scoreSearchMatch prefers relevant product names"
   );
 
@@ -94,6 +94,17 @@ async function main() {
   ok(needQ?.ml === 250, "quantity field ml");
   const needEach = parseIngredientNeed("2 onions", undefined);
   ok(needEach?.each === 2, "leading count in note -> each");
+  ok(parseIngredientNeed("2", undefined) == null, "plain number in note is not each (ambiguous)");
+  const needPlainQty = parseIngredientNeed("flour", "3", { mealiePlainEach: true });
+  ok(needPlainQty?.each === 3, "plain Mealie quantity + mealiePlainEach -> each");
+  const needUn = parseIngredientNeed("3 un cebola", undefined);
+  ok(needUn?.each === 3, "3 un -> explicit count unit");
+  const needPcs = parseIngredientNeed("2 pcs garlic", undefined);
+  ok(needPcs?.each === 2, "2 pcs -> each");
+  const needOilMl = parseIngredientNeed("2 tbsp olive oil", undefined, {
+    liquidVolumeConversions: true,
+  });
+  ok(needOilMl?.ml === 30, "tbsp on liquid note -> ml when liquidVolumeConversions");
   const scaledNeed = scaleIngredientNeed({ grams: 600 }, 0.75);
   ok(scaledNeed?.grams === 450, "scaleIngredientNeed scales parsed quantity");
   eq(formatIngredientNeed(scaledNeed), "450 g", "formatIngredientNeed serializes scaled quantity");
@@ -120,6 +131,14 @@ async function main() {
   ok(
     best?.price.store === "A" && best?.estimate.estimatedCostEur === 2.5,
     "selectBestPriceForNeed chooses lowest line cost, not lowest sticker price"
+  );
+  const ambRow = enrichPriceResults([
+    { store: "X", productName: "6-pack", priceEur: 2, unitSize: "6 un" },
+  ])[0];
+  const ambEst = estimateLineCost(ambRow, { each: 2 });
+  ok(
+    ambEst.basis === "sticker_each_vs_multipack_ambiguous" && ambEst.estimatedCostEur === 2,
+    "each need vs multipack unitCount without pack mass -> sticker + ambiguous basis"
   );
 
   console.log("\ngetScrapers stub flags");
@@ -158,6 +177,23 @@ async function main() {
     getCachedPriceSearch(`${u}_variant`, 3)?.prices[0]?.productName === "Three",
     "price cache key includes max results variant"
   );
+  const prevSchema = process.env.ENRICHMENT_CACHE_SCHEMA_VERSION;
+  process.env.ENRICHMENT_CACHE_SCHEMA_VERSION = "schema_test_a";
+  clearCache();
+  const sk = `__cache_schema_${Date.now()}`;
+  setCachedPriceSearch(
+    sk,
+    { prices: [], storeOutcomes: [{ store: "Continente", status: "empty", resultCount: 0 }] },
+    3
+  );
+  ok(getCachedPriceSearch(sk, 3) != null, "hit under schema A");
+  process.env.ENRICHMENT_CACHE_SCHEMA_VERSION = "schema_test_b";
+  ok(getCachedPriceSearch(sk, 3) == null, "miss after ENRICHMENT_CACHE_SCHEMA_VERSION bump");
+  if (prevSchema === undefined) {
+    delete process.env.ENRICHMENT_CACHE_SCHEMA_VERSION;
+  } else {
+    process.env.ENRICHMENT_CACHE_SCHEMA_VERSION = prevSchema;
+  }
   clearCache();
 
   console.log("\nsearchAllStores shape (no network: empty query)");

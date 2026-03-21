@@ -35,13 +35,15 @@ import {
   getNutritionByBarcode,
   enrichIngredient,
   enrichIngredients,
-  formatIngredientNeed,
-  parseIngredientNeed,
-  scaleIngredientNeed,
+  enrichmentLineFromShoppingListItem,
+  enrichmentLinesFromRecipeIngredients,
+  scaleEnrichmentLinesForServings,
+  summarizePriceCoverageForEnriched,
+  rollupStoreOutcomes,
+  degradedStoreNames,
 } from './food-pipeline/index.js';
 import {
   addCalendarDays,
-  normalizeIngredientLines,
   normalizeMealPlanEntryDate,
   resolveRequestedStartDate,
 } from './meal-planning/index.js';
@@ -723,10 +725,9 @@ function createMcpServer(): Server {
         }
 
         // Build ingredient list from shopping items
-        const toEnrich = items.map((item: any) => ({
-          note: item.display ?? item.note ?? item.food?.name ?? 'unknown',
-          quantity: item.quantity != null ? String(item.quantity) : undefined,
-        }));
+        const toEnrich = items.map((item: any) =>
+          enrichmentLineFromShoppingListItem(item as Record<string, unknown>)
+        );
 
         const enriched = await enrichIngredients(toEnrich, {
           skipPrice: args.skip_price === true,
@@ -741,6 +742,7 @@ function createMcpServer(): Server {
           if (e.estimatedCostEur != null) { totalEstimatedCost += e.estimatedCostEur; itemsWithPrice++; }
           if (e.nutrition) itemsWithNutrition++;
         }
+        const priceCoverage = summarizePriceCoverageForEnriched(enriched);
 
         // Write-back enriched data to Mealie if requested
         let writeBackResults: { success: number; failed: number; errors: string[] } | undefined;
@@ -827,6 +829,11 @@ function createMcpServer(): Server {
           itemsWithPrice,
           itemsWithNutrition,
           totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
+          priceCoverage,
+          ...(priceCoverage.partialPriceCoverage && {
+            priceCoverageWarning:
+              'Totals may be incomplete: scrape errors, stub stores, or limited live coverage. See priceCoverage.',
+          }),
           ...(writeBack && writeBackResults && {
             writeBack: {
               enabled: true,
@@ -898,8 +905,12 @@ function createMcpServer(): Server {
           })
         );
 
-        // Build ingredient list with recipe associations
-        const ingredientLines: { note: string; recipeSlug: string; recipeName: string }[] = [];
+        // Build ingredient list with recipe associations (structured Mealie qty/unit when present)
+        const ingredientLines: {
+          line: { note: string; quantity?: string; mealiePlainQuantityIsEach?: boolean };
+          recipeSlug: string;
+          recipeName: string;
+        }[] = [];
         const recipesWithoutIngredients: { slug: string; name: string }[] = [];
         const failedRecipes: { slug: string; error: string }[] = [];
 
@@ -916,17 +927,15 @@ function createMcpServer(): Server {
           }
           if (!recipe) continue;
 
-          const lines = normalizeIngredientLines(recipe?.recipeIngredient);
+          const lineIns = enrichmentLinesFromRecipeIngredients(recipe?.recipeIngredient);
           const recipeName = slugToRecipe.get(slug)?.name ?? slug;
 
-          if (lines.length === 0) {
+          if (lineIns.length === 0) {
             recipesWithoutIngredients.push({ slug, name: recipeName });
           }
 
-          for (const line of lines) {
-            if (typeof line === 'string' && line.trim()) {
-              ingredientLines.push({ note: line.trim(), recipeSlug: slug, recipeName });
-            }
+          for (const line of lineIns) {
+            ingredientLines.push({ line, recipeSlug: slug, recipeName });
           }
         }
 
@@ -951,9 +960,11 @@ function createMcpServer(): Server {
 
         // Enrich ingredients (recipe association is tracked via index alignment)
         const enriched = await enrichIngredients(
-          ingredientLines.map(({ note }) => ({ note, quantity: undefined })),
+          ingredientLines.map(({ line }) => line),
           { skipPrice: args.skip_price === true, skipNutrition: args.skip_nutrition === true }
         );
+
+        const priceCoverage = summarizePriceCoverageForEnriched(enriched);
 
         // Re-associate enriched results with recipe info
         const enrichedWithRecipe = enriched.map((e, idx) => ({
@@ -993,6 +1004,11 @@ function createMcpServer(): Server {
           recipesInPeriod: slugs.length,
           totalIngredients: enriched.length,
           totalEstimatedCostEur: Math.round(totalCost * 100) / 100,
+          priceCoverage,
+          ...(priceCoverage.partialPriceCoverage && {
+            priceCoverageWarning:
+              'Totals may be incomplete: scrape errors, stub stores, or limited live coverage. See priceCoverage.',
+          }),
           byRecipe: [...recipeCostMap.values()].map(r => ({
             slug: r.slug,
             name: r.name,
@@ -1063,10 +1079,12 @@ function createMcpServer(): Server {
         const scaleFactor = servings ? servings / defaultServings : 1;
         const targetServings = servings ?? defaultServings;
 
-        // Extract ingredients - handle both string[] and object[] formats
-        const ingredientLines = normalizeIngredientLines(recipe.recipeIngredient);
+        const lineInputs = scaleEnrichmentLinesForServings(
+          recipe.recipeIngredient,
+          scaleFactor
+        );
 
-        if (ingredientLines.length === 0) {
+        if (lineInputs.length === 0) {
           return {
             content: [{
               type: 'text', text: JSON.stringify({
@@ -1081,20 +1099,11 @@ function createMcpServer(): Server {
           };
         }
 
-        // Enrich ingredients
-        const toEnrich = ingredientLines.map((line: string) => {
-          const scaledNeed = scaleIngredientNeed(parseIngredientNeed(line), scaleFactor);
-          return {
-            note: line,
-            quantity: scaleFactor !== 1 ? formatIngredientNeed(scaledNeed) : undefined,
-          };
-        });
-        const enriched = await enrichIngredients(toEnrich, {
+        const enriched = await enrichIngredients(lineInputs, {
           skipPrice: false,
           skipNutrition: !includeNutrition
         });
 
-        // Calculate costs directly from the scaled ingredient needs.
         let totalCost = 0;
         let itemsWithPrice = 0;
         for (const e of enriched) {
@@ -1103,6 +1112,8 @@ function createMcpServer(): Server {
             itemsWithPrice++;
           }
         }
+
+        const priceCoverage = summarizePriceCoverageForEnriched(enriched);
 
         const report = {
           recipe: {
@@ -1118,6 +1129,11 @@ function createMcpServer(): Server {
           perServingCostEur: Math.round((totalCost / targetServings) * 100) / 100,
           itemsWithPrice,
           itemsWithNutrition: enriched.filter(e => e.nutrition).length,
+          priceCoverage,
+          ...(priceCoverage.partialPriceCoverage && {
+            priceCoverageWarning:
+              'Totals may be incomplete: scrape errors, stub stores, or limited live coverage. See priceCoverage.',
+          }),
         };
 
         return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
@@ -1159,14 +1175,14 @@ function createMcpServer(): Server {
           return { content: [{ type: 'text', text: `Shopping list "${listName}" has no ${includeChecked ? '' : 'unchecked '}items to enrich.` }] };
         }
 
-        // Build ingredient list
-        const toEnrich = items.map((item: any) => ({
-          note: item.display ?? item.note ?? item.food?.name ?? 'unknown',
-          quantity: item.quantity != null ? String(item.quantity) : undefined,
-        }));
+        const toEnrich = items.map((item: any) =>
+          enrichmentLineFromShoppingListItem(item as Record<string, unknown>)
+        );
 
-        // Enrich all items
         const enriched = await enrichIngredients(toEnrich, { skipPrice: false, skipNutrition: false });
+        const priceCoverage = summarizePriceCoverageForEnriched(enriched);
+        const rollup = rollupStoreOutcomes(enriched);
+        const degradedStores = degradedStoreNames(rollup);
 
         // Group by store if requested
         let byStore: Record<string, any[]> | undefined;
@@ -1197,9 +1213,14 @@ function createMcpServer(): Server {
             itemCount: items.length,
           }));
 
-          // Sort stores by total cost if optimizing route
+          // Sort by subtotal, but deprioritize stores that had scrape errors in any line lookup
           if (optimizeRoute) {
-            storeTotals.sort((a, b) => a.totalCost - b.totalCost);
+            storeTotals.sort((a, b) => {
+              const pa = degradedStores.has(a.store) ? 1 : 0;
+              const pb = degradedStores.has(b.store) ? 1 : 0;
+              if (pa !== pb) return pa - pb;
+              return a.totalCost - b.totalCost;
+            });
           }
 
           // Preserve all grouped items; maxStores only limits the recommendation summary.
@@ -1228,10 +1249,18 @@ function createMcpServer(): Server {
           itemsWithPrice,
           itemsWithNutrition,
           totalEstimatedCostEur: Math.round(totalEstimatedCost * 100) / 100,
+          priceCoverage,
+          ...(priceCoverage.partialPriceCoverage && {
+            priceCoverageWarning:
+              'Totals may be incomplete: scrape errors, stub stores, or limited live coverage. See priceCoverage.',
+          }),
           ...(byStore && { byStore }),
           ...(storeOrder && { storeOrder }),
           ...(recommendedStores && { recommendedStores }),
-          ...(optimizeRoute && { optimizedBy: 'estimated_subtotal' }),
+          ...(optimizeRoute && {
+            optimizedBy: 'estimated_subtotal_then_error_penalty',
+            storesDeprioritizedForErrors: [...degradedStores],
+          }),
           items: enriched,
         };
 
@@ -1297,8 +1326,13 @@ function createMcpServer(): Server {
           })
         );
 
-        // Collect all ingredients
-        const allIngredients: { note: string; recipeSlug: string; recipeName: string }[] = [];
+        const allIngredients: {
+          note: string;
+          quantity?: string;
+          mealiePlainQuantityIsEach?: boolean;
+          recipeSlug: string;
+          recipeName: string;
+        }[] = [];
         const recipeCosts: Map<string, { name: string; slug: string; cost: number; ingredientCount: number }> = new Map();
         const recipesWithoutIngredients: { slug: string; name: string }[] = [];
         const failedRecipes: { slug: string; error: string }[] = [];
@@ -1314,14 +1348,20 @@ function createMcpServer(): Server {
           }
           const { slug, recipe } = result.value;
           const recipeName = slugToRecipe.get(slug)?.name ?? slug;
-          const lines = normalizeIngredientLines(recipe?.recipeIngredient);
+          const lineIns = enrichmentLinesFromRecipeIngredients(recipe?.recipeIngredient);
 
-          if (lines.length === 0) {
+          if (lineIns.length === 0) {
             recipesWithoutIngredients.push({ slug, name: recipeName });
           }
 
-          for (const line of lines) {
-            allIngredients.push({ note: line, recipeSlug: slug, recipeName });
+          for (const line of lineIns) {
+            allIngredients.push({
+              note: line.note,
+              quantity: line.quantity,
+              mealiePlainQuantityIsEach: line.mealiePlainQuantityIsEach,
+              recipeSlug: slug,
+              recipeName,
+            });
           }
         }
 
@@ -1343,10 +1383,18 @@ function createMcpServer(): Server {
           };
         }
 
-        // Consolidate duplicate ingredients if requested
         let ingredientsToEnrich = allIngredients;
         if (consolidateIngredients) {
-          const seen = new Map<string, { note: string; recipeSlugs: string[]; recipeNames: string[] }>();
+          const seen = new Map<
+            string,
+            {
+              note: string;
+              quantity?: string;
+              mealiePlainQuantityIsEach?: boolean;
+              recipeSlugs: string[];
+              recipeNames: string[];
+            }
+          >();
           for (const ing of allIngredients) {
             const key = ing.note.toLowerCase().trim();
             if (seen.has(key)) {
@@ -1356,21 +1404,33 @@ function createMcpServer(): Server {
                 existing.recipeNames.push(ing.recipeName);
               }
             } else {
-              seen.set(key, { note: ing.note, recipeSlugs: [ing.recipeSlug], recipeNames: [ing.recipeName] });
+              seen.set(key, {
+                note: ing.note,
+                quantity: ing.quantity,
+                mealiePlainQuantityIsEach: ing.mealiePlainQuantityIsEach,
+                recipeSlugs: [ing.recipeSlug],
+                recipeNames: [ing.recipeName],
+              });
             }
           }
-          ingredientsToEnrich = [...seen.values()].map(v => ({
+          ingredientsToEnrich = [...seen.values()].map((v) => ({
             note: v.note,
+            quantity: v.quantity,
+            mealiePlainQuantityIsEach: v.mealiePlainQuantityIsEach,
             recipeSlug: v.recipeSlugs.join(','),
-            recipeName: v.recipeNames.join(', ')
+            recipeName: v.recipeNames.join(', '),
           }));
         }
 
-        // Enrich all ingredients
         const enriched = await enrichIngredients(
-          ingredientsToEnrich.map(({ note }) => ({ note, quantity: undefined })),
+          ingredientsToEnrich.map(({ note, quantity, mealiePlainQuantityIsEach }) => ({
+            note,
+            quantity,
+            mealiePlainQuantityIsEach,
+          })),
           { skipPrice: false, skipNutrition: !includeNutrition }
         );
+        const priceCoverage = summarizePriceCoverageForEnriched(enriched);
 
         // Calculate per-recipe costs
         let totalCost = 0;
@@ -1421,6 +1481,11 @@ function createMcpServer(): Server {
           perDayCostEur: Math.round((totalCost / days) * 100) / 100,
           totalIngredients: enriched.length,
           uniqueIngredients: consolidateIngredients ? ingredientsToEnrich.length : undefined,
+          priceCoverage,
+          ...(priceCoverage.partialPriceCoverage && {
+            priceCoverageWarning:
+              'Totals may be incomplete: scrape errors, stub stores, or limited live coverage. See priceCoverage.',
+          }),
           byRecipe: [...recipeCosts.values()].map(r => ({
             slug: r.slug,
             name: r.name,
@@ -1488,21 +1553,22 @@ function createMcpServer(): Server {
         if (includeCosts) {
           recipesWithCosts = await Promise.all(
             recipes.map(async (recipe: any) => {
-              const ingredientLines = normalizeIngredientLines(recipe?.recipeIngredient);
+              const lineInputs = scaleEnrichmentLinesForServings(recipe?.recipeIngredient, 1);
 
-              if (ingredientLines.length === 0) {
+              if (lineInputs.length === 0) {
                 return { ...recipe, totalCostEur: null, ingredientCount: 0 };
               }
-              const enriched = await enrichIngredients(
-                ingredientLines.map((note: string) => ({ note, quantity: undefined })),
-                { skipPrice: false, skipNutrition: true }
-              );
+              const enriched = await enrichIngredients(lineInputs, {
+                skipPrice: false,
+                skipNutrition: true,
+              });
               const totalCost = enriched.reduce((sum, e) => sum + (e.estimatedCostEur ?? 0), 0);
               return {
                 ...recipe,
                 totalCostEur: Math.round(totalCost * 100) / 100,
-                ingredientCount: ingredientLines.length,
-                perServingCostEur: recipe.recipeServings ? Math.round((totalCost / recipe.recipeServings) * 100) / 100 : undefined
+                ingredientCount: lineInputs.length,
+                perServingCostEur: recipe.recipeServings ? Math.round((totalCost / recipe.recipeServings) * 100) / 100 : undefined,
+                priceCoverage: summarizePriceCoverageForEnriched(enriched),
               };
             })
           );

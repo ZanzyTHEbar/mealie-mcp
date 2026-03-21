@@ -1,13 +1,8 @@
 /**
  * Shopping list enrichment logic.
  *
- * Combines all registered grocery scrapers (Continente, Pingo Doce, Aldi, Lidl, etc.)
- * and Open Food Facts nutrition lookup into a single enrichment step per ingredient.
- * Also includes the search-term extraction heuristic.
- *
- * Caching: Price and nutrition results are cached with 24h TTL (configurable via
- * ENRICHMENT_CACHE_TTL_HOURS environment variable). Set ENRICHMENT_CACHE_ENABLED=false
- * to disable caching. Empty price results are cached (negative cache).
+ * Caching: Price and nutrition results use TTL (ENRICHMENT_CACHE_TTL_HOURS).
+ * Empty price searches are cached. Price cache keys include ENRICHMENT_CACHE_SCHEMA_VERSION.
  */
 
 import { searchAllStores } from "./scrapers/registry.js";
@@ -23,19 +18,55 @@ import {
 import {
   enrichPriceResults,
   estimateLineCost,
+  formatIngredientNeed,
+  isLiquidVolumeConversionEnabled,
   parseIngredientNeed,
+  scaleIngredientNeed,
   selectBestPriceForNeed,
 } from "./price-normalize.js";
 import { extractSearchTerm } from "./query-normalize.js";
+import {
+  enrichmentLinesFromRecipeIngredients,
+  type EnrichmentLineInput,
+} from "./mealie-enrichment-input.js";
+
+export type { EnrichmentLineInput } from "./mealie-enrichment-input.js";
 
 /**
- * Enrich a single ingredient string with price and nutrition data.
- *
- * Results are automatically cached with TTL to avoid repeated API calls.
+ * Scale structured recipe ingredient lines for target servings (preserves Mealie quantity/unit when parseable).
  */
-export async function enrichIngredient(
-  note: string,
-  quantity?: string,
+export function scaleEnrichmentLinesForServings(
+  recipeIngredient: unknown,
+  scaleFactor: number
+): EnrichmentLineInput[] {
+  const lines = enrichmentLinesFromRecipeIngredients(recipeIngredient);
+  if (
+    scaleFactor === 1 ||
+    !Number.isFinite(scaleFactor) ||
+    scaleFactor <= 0
+  ) {
+    return lines;
+  }
+  const liq = isLiquidVolumeConversionEnabled();
+  return lines.map((input) => {
+    const need = parseIngredientNeed(input.note, input.quantity, {
+      mealiePlainEach: input.mealiePlainQuantityIsEach === true,
+      liquidVolumeConversions: liq,
+    });
+    const scaled = scaleIngredientNeed(need, scaleFactor);
+    return {
+      note: input.note,
+      quantity: scaled ? formatIngredientNeed(scaled) : input.quantity,
+      mealiePlainQuantityIsEach: scaled ? false : input.mealiePlainQuantityIsEach,
+    };
+  });
+}
+
+/**
+ * Enrich a single line (prefer this for Mealie-structured quantity/unit).
+ */
+export async function enrichIngredientLine(
+  line: EnrichmentLineInput,
   options?: {
     skipPrice?: boolean;
     skipNutrition?: boolean;
@@ -43,6 +74,7 @@ export async function enrichIngredient(
     skipCache?: boolean;
   }
 ): Promise<EnrichedItem> {
+  const { note, quantity, mealiePlainQuantityIsEach } = line;
   const searchTerm = extractSearchTerm(note);
   const maxResults = options?.maxPriceResults ?? 3;
   const useCache = isCacheEnabled() && !options?.skipCache;
@@ -54,7 +86,6 @@ export async function enrichIngredient(
     prices: [],
   };
 
-  // 1. Price lookup (with caching, including negative cache)
   if (!options?.skipPrice) {
     const cachedPrice = useCache ? getCachedPriceSearch(searchTerm, maxResults) : undefined;
 
@@ -65,21 +96,25 @@ export async function enrichIngredient(
         item.prices = enrichPriceResults(item.prices);
       }
     } else {
-      const { results, storeOutcomes } = await searchAllStores(
-        searchTerm,
-        maxResults
-      );
+      const { results, storeOutcomes } = await searchAllStores(searchTerm, maxResults);
       item.prices = results;
       item.storeSearchOutcomes = storeOutcomes;
       if (useCache) {
-        setCachedPriceSearch(searchTerm, {
-          prices: results,
-          storeOutcomes,
-        }, maxResults);
+        setCachedPriceSearch(
+          searchTerm,
+          {
+            prices: results,
+            storeOutcomes,
+          },
+          maxResults
+        );
       }
     }
 
-    const need = parseIngredientNeed(note, quantity);
+    const need = parseIngredientNeed(note, quantity, {
+      mealiePlainEach: mealiePlainQuantityIsEach === true,
+      liquidVolumeConversions: isLiquidVolumeConversionEnabled(),
+    });
     const selection = selectBestPriceForNeed(item.prices, need);
     if (selection) {
       item.cheapestPrice = selection.price;
@@ -93,7 +128,6 @@ export async function enrichIngredient(
     }
   }
 
-  // 2. Nutrition lookup (with caching)
   if (!options?.skipNutrition) {
     if (useCache) {
       const cached = getCachedNutrition(searchTerm);
@@ -115,10 +149,29 @@ export async function enrichIngredient(
 }
 
 /**
- * Enrich multiple ingredient strings.
+ * Back-compat: enrich from raw strings (no Mealie plain-each semantics).
+ */
+export async function enrichIngredient(
+  note: string,
+  quantity?: string,
+  options?: {
+    skipPrice?: boolean;
+    skipNutrition?: boolean;
+    maxPriceResults?: number;
+    skipCache?: boolean;
+  }
+): Promise<EnrichedItem> {
+  return enrichIngredientLine(
+    { note, quantity, mealiePlainQuantityIsEach: false },
+    options
+  );
+}
+
+/**
+ * Enrich multiple lines (shopping list / recipe ingredients).
  */
 export async function enrichIngredients(
-  items: Array<{ note: string; quantity?: string }>,
+  items: EnrichmentLineInput[],
   options?: {
     skipPrice?: boolean;
     skipNutrition?: boolean;
@@ -126,8 +179,8 @@ export async function enrichIngredients(
   }
 ): Promise<EnrichedItem[]> {
   const results: EnrichedItem[] = [];
-  for (const { note, quantity } of items) {
-    results.push(await enrichIngredient(note, quantity, options));
+  for (const line of items) {
+    results.push(await enrichIngredientLine(line, options));
   }
   return results;
 }
