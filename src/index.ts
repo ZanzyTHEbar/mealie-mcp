@@ -37,6 +37,7 @@ import {
   enrichIngredients,
   enrichmentLineFromShoppingListItem,
   enrichmentLinesFromRecipeIngredients,
+  mergeEnrichmentLines,
   scaleEnrichmentLinesForServings,
   summarizePriceCoverageForEnriched,
   rollupStoreOutcomes,
@@ -1385,35 +1386,58 @@ function createMcpServer(): Server {
 
         let ingredientsToEnrich = allIngredients;
         if (consolidateIngredients) {
-          const seen = new Map<
+          const grouped = new Map<
             string,
-            {
+            Array<{
               note: string;
               quantity?: string;
               mealiePlainQuantityIsEach?: boolean;
               recipeSlugs: string[];
               recipeNames: string[];
-            }
+            }>
           >();
           for (const ing of allIngredients) {
             const key = ing.note.toLowerCase().trim();
-            if (seen.has(key)) {
-              const existing = seen.get(key)!;
+            const bucket = grouped.get(key) ?? [];
+            let merged = false;
+
+            for (const existing of bucket) {
+              const mergedLine = mergeEnrichmentLines(
+                {
+                  note: existing.note,
+                  quantity: existing.quantity,
+                  mealiePlainQuantityIsEach: existing.mealiePlainQuantityIsEach,
+                },
+                ing
+              );
+              if (!mergedLine) {
+                continue;
+              }
+
+              existing.note = mergedLine.note;
+              existing.quantity = mergedLine.quantity;
+              existing.mealiePlainQuantityIsEach =
+                mergedLine.mealiePlainQuantityIsEach;
               if (!existing.recipeSlugs.includes(ing.recipeSlug)) {
                 existing.recipeSlugs.push(ing.recipeSlug);
                 existing.recipeNames.push(ing.recipeName);
               }
-            } else {
-              seen.set(key, {
+              merged = true;
+              break;
+            }
+
+            if (!merged) {
+              bucket.push({
                 note: ing.note,
                 quantity: ing.quantity,
                 mealiePlainQuantityIsEach: ing.mealiePlainQuantityIsEach,
                 recipeSlugs: [ing.recipeSlug],
                 recipeNames: [ing.recipeName],
               });
+              grouped.set(key, bucket);
             }
           }
-          ingredientsToEnrich = [...seen.values()].map((v) => ({
+          ingredientsToEnrich = [...grouped.values()].flat().map((v) => ({
             note: v.note,
             quantity: v.quantity,
             mealiePlainQuantityIsEach: v.mealiePlainQuantityIsEach,

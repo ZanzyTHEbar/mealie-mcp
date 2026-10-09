@@ -24,6 +24,7 @@ export {
   enrichIngredient,
   enrichIngredientLine,
   enrichIngredients,
+  mergeEnrichmentLines,
   scaleEnrichmentLinesForServings,
 } from "./enricher.js";
 export type { EnrichmentLineInput } from "./mealie-enrichment-input.js";

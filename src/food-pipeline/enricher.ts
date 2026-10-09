@@ -19,6 +19,7 @@ import {
   enrichPriceResults,
   estimateLineCost,
   formatIngredientNeed,
+  type IngredientNeed,
   isLiquidVolumeConversionEnabled,
   parseIngredientNeed,
   scaleIngredientNeed,
@@ -31,6 +32,69 @@ import {
 } from "./mealie-enrichment-input.js";
 
 export type { EnrichmentLineInput } from "./mealie-enrichment-input.js";
+
+function parseNeedForLine(line: EnrichmentLineInput): IngredientNeed | null {
+  return parseIngredientNeed(line.note, line.quantity, {
+    mealiePlainEach: line.mealiePlainQuantityIsEach === true,
+    liquidVolumeConversions: isLiquidVolumeConversionEnabled(),
+  });
+}
+
+function shouldKeepPlainEachHint(need: IngredientNeed | null): boolean {
+  return need?.each != null && need.grams == null && need.ml == null;
+}
+
+function mergeIngredientNeeds(
+  left: IngredientNeed | null,
+  right: IngredientNeed | null
+): IngredientNeed | null {
+  if (left?.grams != null && right?.grams != null) {
+    return { grams: left.grams + right.grams };
+  }
+  if (left?.ml != null && right?.ml != null) {
+    return { ml: left.ml + right.ml };
+  }
+  if (left?.each != null && right?.each != null) {
+    return { each: left.each + right.each };
+  }
+  return null;
+}
+
+export function mergeEnrichmentLines(
+  left: EnrichmentLineInput,
+  right: EnrichmentLineInput
+): EnrichmentLineInput | null {
+  const leftNeed = parseNeedForLine(left);
+  const rightNeed = parseNeedForLine(right);
+
+  if (leftNeed != null && rightNeed != null) {
+    const mergedNeed = mergeIngredientNeeds(leftNeed, rightNeed);
+    if (mergedNeed == null) {
+      return null;
+    }
+    return {
+      note: left.note,
+      quantity: formatIngredientNeed(mergedNeed),
+      mealiePlainQuantityIsEach: shouldKeepPlainEachHint(mergedNeed),
+    };
+  }
+
+  if (leftNeed == null && rightNeed == null) {
+    if (
+      (left.quantity ?? undefined) === (right.quantity ?? undefined) &&
+      (left.mealiePlainQuantityIsEach === true) ===
+      (right.mealiePlainQuantityIsEach === true)
+    ) {
+      return {
+        note: left.note,
+        quantity: left.quantity,
+        mealiePlainQuantityIsEach: left.mealiePlainQuantityIsEach === true,
+      };
+    }
+  }
+
+  return null;
+}
 
 /**
  * Scale structured recipe ingredient lines for target servings (preserves Mealie quantity/unit when parseable).
@@ -47,17 +111,15 @@ export function scaleEnrichmentLinesForServings(
   ) {
     return lines;
   }
-  const liq = isLiquidVolumeConversionEnabled();
   return lines.map((input) => {
-    const need = parseIngredientNeed(input.note, input.quantity, {
-      mealiePlainEach: input.mealiePlainQuantityIsEach === true,
-      liquidVolumeConversions: liq,
-    });
+    const need = parseNeedForLine(input);
     const scaled = scaleIngredientNeed(need, scaleFactor);
     return {
       note: input.note,
       quantity: scaled ? formatIngredientNeed(scaled) : input.quantity,
-      mealiePlainQuantityIsEach: scaled ? false : input.mealiePlainQuantityIsEach,
+      mealiePlainQuantityIsEach: scaled
+        ? shouldKeepPlainEachHint(scaled)
+        : input.mealiePlainQuantityIsEach,
     };
   });
 }
@@ -74,7 +136,7 @@ export async function enrichIngredientLine(
     skipCache?: boolean;
   }
 ): Promise<EnrichedItem> {
-  const { note, quantity, mealiePlainQuantityIsEach } = line;
+  const { note, quantity } = line;
   const searchTerm = extractSearchTerm(note);
   const maxResults = options?.maxPriceResults ?? 3;
   const useCache = isCacheEnabled() && !options?.skipCache;
@@ -111,10 +173,7 @@ export async function enrichIngredientLine(
       }
     }
 
-    const need = parseIngredientNeed(note, quantity, {
-      mealiePlainEach: mealiePlainQuantityIsEach === true,
-      liquidVolumeConversions: isLiquidVolumeConversionEnabled(),
-    });
+    const need = parseNeedForLine(line);
     const selection = selectBestPriceForNeed(item.prices, need);
     if (selection) {
       item.cheapestPrice = selection.price;

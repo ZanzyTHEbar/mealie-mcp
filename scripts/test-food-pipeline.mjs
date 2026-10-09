@@ -29,7 +29,9 @@ async function main() {
     getCachedPriceSearch,
     setCachedPriceSearch,
     clearCache,
+    mergeEnrichmentLines,
     searchAllStores,
+    scaleEnrichmentLinesForServings,
   } = fp;
   let passed = 0;
   let failed = 0;
@@ -108,6 +110,22 @@ async function main() {
   const scaledNeed = scaleIngredientNeed({ grams: 600 }, 0.75);
   ok(scaledNeed?.grams === 450, "scaleIngredientNeed scales parsed quantity");
   eq(formatIngredientNeed(scaledNeed), "450 g", "formatIngredientNeed serializes scaled quantity");
+  const scaledEggLines = scaleEnrichmentLinesForServings([
+    {
+      food: { name: "eggs" },
+      quantity: 2,
+    },
+  ], 0.5);
+  eq(scaledEggLines[0]?.quantity, "1", "scaled plain-count recipe ingredient serializes to bare number");
+  ok(
+    scaledEggLines[0]?.mealiePlainQuantityIsEach === true &&
+    parseIngredientNeed(
+      scaledEggLines[0].note,
+      scaledEggLines[0].quantity,
+      { mealiePlainEach: scaledEggLines[0].mealiePlainQuantityIsEach }
+    )?.each === 1,
+    "scaled plain-count recipe ingredient keeps mealiePlainEach semantics"
+  );
 
   console.log("\nenrichPriceResults + estimateLineCost");
   const rows = enrichPriceResults([
@@ -146,6 +164,31 @@ async function main() {
   const aldi = scrapers.find((s) => s.name === "Aldi");
   const lidl = scrapers.find((s) => s.name === "Lidl");
   ok(aldi?.isStub === true && lidl?.isStub === true, "Aldi/Lidl marked isStub");
+
+  console.log("\nmergeEnrichmentLines");
+  const mergedFlour = mergeEnrichmentLines(
+    { note: "flour", quantity: "500 g", mealiePlainQuantityIsEach: false },
+    { note: "flour", quantity: "200 g", mealiePlainQuantityIsEach: false }
+  );
+  ok(
+    mergedFlour?.quantity === "700 g" && mergedFlour.mealiePlainQuantityIsEach === false,
+    "mergeEnrichmentLines sums structured gram quantities for duplicate notes"
+  );
+  const mergedEggs = mergeEnrichmentLines(
+    { note: "eggs", quantity: "2", mealiePlainQuantityIsEach: true },
+    { note: "eggs", quantity: "3", mealiePlainQuantityIsEach: true }
+  );
+  ok(
+    mergedEggs?.quantity === "5" && mergedEggs.mealiePlainQuantityIsEach === true,
+    "mergeEnrichmentLines preserves plain-each hint for duplicate count quantities"
+  );
+  ok(
+    mergeEnrichmentLines(
+      { note: "flour", quantity: "500 g", mealiePlainQuantityIsEach: false },
+      { note: "flour", quantity: "2", mealiePlainQuantityIsEach: true }
+    ) == null,
+    "mergeEnrichmentLines refuses incompatible duplicate quantities"
+  );
 
   console.log("\nprice cache (negative + outcomes)");
   clearCache();
