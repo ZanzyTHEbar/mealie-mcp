@@ -146,9 +146,23 @@ class MCPStreamableHttpServer {
         return toFetchResponse(res);
       }
 
-      // Invalid request (no session ID and not initialize)
+      // A session ID was supplied but its transport is gone (the session
+      // expired or the transport was closed via onclose). The MCP Streamable
+      // HTTP spec requires responding 404 here so the client starts a new
+      // session with a fresh initialize request. Returning 400 (the previous
+      // behavior) left long-lived clients stuck once their session was evicted,
+      // surfacing as an intermittent connection failure on the next tool call.
+      if (sessionId) {
+        console.error(`Unrecognized or expired session ID: ${sessionId}; responding 404 to prompt re-initialization`);
+        return c.json(
+          this.createErrorResponse("Session not found or expired. Start a new session with an initialize request."),
+          404
+        );
+      }
+
+      // No session ID and not an initialize request.
       return c.json(
-        this.createErrorResponse("Bad Request: invalid session ID or method."),
+        this.createErrorResponse("Bad Request: no session ID and not an initialize request."),
         400
       );
     } catch (error) {
